@@ -1,0 +1,33 @@
+[package]
+name = "speech-prep"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "Speech-focused audio preprocessing — VAD, format detection, decoding, noise reduction, chunking"
+repository = "https://github.com/dnvt/speech-prep"
+readme = "README.md"
+keywords = ["speech", "audio", "vad", "preprocessing", "voice"]
+categories = ["science", "multimedia::audio"]
+exclude = ["tests/", "datasets/", "fixtures/"]
+
+[dependencies]
+hound = "3"
+symphonia = { version = "0.5", features = ["all"] }
+realfft = "3.5"
+parking_lot = "0.12"
+tracing = "0.1"
+thiserror = "2"
+
+serde_json = "1"
+
+# Only needed with the `fixtures` feature
+glob = { version = "0.3", optional = true }
+
+[features]
+fixtures = ["dep:glob"]
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.9"
+glob = "0.3"
