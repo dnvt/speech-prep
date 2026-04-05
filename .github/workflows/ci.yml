@@ -29,6 +29,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  test-fixtures:
+    name: Test Fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features fixtures
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

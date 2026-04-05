@@ -11,10 +11,18 @@
 //! ## Usage
 //!
 //! ```rust
-//! use speech_prep::VadConfig;
+//! use std::sync::Arc;
+//! use speech_prep::{NoopVadMetricsCollector, VadConfig, VadDetector, VadMetricsCollector};
 //!
+//! # fn main() -> Result<(), speech_prep::Error> {
 //! let config = VadConfig::default();
-//! assert!(config.base_threshold > 0.0);
+//! let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
+//! let detector = VadDetector::new(config, metrics)?;
+//!
+//! let audio_samples = vec![0.0; 16_000];
+//! let _segments = detector.detect(&audio_samples)?;
+//! # Ok(())
+//! # }
 //! ```
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]

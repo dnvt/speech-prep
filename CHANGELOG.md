@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 — 2026-04-04
+
+- Reduced Symphonia to the targeted feature set needed for the crate's advertised format support
+- Added `cargo test --features fixtures` to CI coverage
+- Replaced the crate-level rustdoc snippet with a complete VAD example
+
 ## 0.1.3 — 2026-04-04
 
 - Tightened the published crate contents with an explicit package allowlist

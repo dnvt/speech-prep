@@ -19,17 +19,12 @@ Run the full verification set before opening a pull request:
 ```bash
 cargo test
 cargo test -- --ignored
+cargo test --features fixtures
 cargo clippy -- -D warnings
 cargo fmt --check
 cargo doc --no-deps
 cargo run --example vad_detect
 cargo package --allow-dirty
-```
-
-Optional checks:
-
-```bash
-cargo test --features fixtures
 ```
 
 Call out public API changes in the pull request description and update `CHANGELOG.md` when behavior or compatibility changes.
