@@ -722,6 +722,7 @@ mod tests {
 
     /// Test <60ms latency performance contract for audio processing.
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "Performance — run with --release")]
     fn test_latency_performance_contract() {
         let coordinator =
             AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
