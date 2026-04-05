@@ -12,7 +12,6 @@ keywords = ["speech", "audio", "vad", "preprocessing", "voice"]
 categories = ["science", "multimedia::audio"]
 include = [
     "Cargo.toml",
-    "CHANGELOG.md",
     "README.md",
     "LICENSE-APACHE",
     "LICENSE-MIT",
