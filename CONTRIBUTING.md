@@ -21,6 +21,7 @@ cargo test
 cargo test -- --ignored
 cargo clippy -- -D warnings
 cargo fmt --check
+cargo doc --no-deps
 cargo run --example vad_detect
 cargo package --allow-dirty
 ```

@@ -84,7 +84,7 @@ impl std::fmt::Display for AudioTimestamp {
 }
 
 /// Range validation helper.
-pub fn validate_in_range<T: PartialOrd + std::fmt::Display>(
+pub(crate) fn validate_in_range<T: PartialOrd + std::fmt::Display>(
     value: T,
     min: T,
     max: T,

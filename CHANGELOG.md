@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 — 2026-04-04
+
+- Tightened the published crate contents with an explicit package allowlist
+- Made `serde_json` fixture-only instead of a core library dependency
+- Added docs verification to CI and contributor checks
+- Completed the README usage example and trimmed small internal-only API exports
+
 ## 0.1.2 — 2026-04-04
 
 - Aligned crate docs and package metadata with the current WAV-only decoding scope

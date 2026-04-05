@@ -48,6 +48,6 @@ pub use preprocessing::{
     DcHighPassFilter, HighpassOrder, NoiseReducer, NoiseReductionConfig, PreprocessingConfig,
     VadContext,
 };
-pub use time::{AudioDuration, AudioInstant, AudioTimestamp};
+pub use time::{AudioDuration, AudioTimestamp};
 pub use types::AudioChunk;
 pub use vad::{NoopVadMetricsCollector, SpeechChunk, VadConfig, VadDetector, VadMetricsCollector};

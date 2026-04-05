@@ -30,13 +30,18 @@ Detected 1 speech segment(s):
 use std::sync::Arc;
 use speech_prep::{NoopVadMetricsCollector, VadConfig, VadDetector, VadMetricsCollector};
 
-let config = VadConfig::default();
-let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
-let detector = VadDetector::new(config, metrics)?;
+fn main() -> Result<(), speech_prep::Error> {
+    let config = VadConfig::default();
+    let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
+    let detector = VadDetector::new(config, metrics)?;
 
-let segments = detector.detect(&audio_samples)?;
-for seg in &segments {
-    println!("{:.3}s — {:.3}s", seg.start_time.as_secs(), seg.end_time.as_secs());
+    let audio_samples = vec![0.0; 16_000];
+    let segments = detector.detect(&audio_samples)?;
+    for seg in &segments {
+        println!("{:.3}s — {:.3}s", seg.start_time.as_secs(), seg.end_time.as_secs());
+    }
+
+    Ok(())
 }
 ```
 
@@ -47,7 +52,7 @@ Raw audio bytes
     │
     ▼
 Format detection ─→ Decoding ─→ Resampling ─→ Channel mixing
-  (format.rs)      (decoder/)    (16kHz)       (mono)
+  (format.rs)      (WAV)         (16kHz)       (mono)
     │
     ▼
 Preprocessing ─→ VAD ─→ Chunking

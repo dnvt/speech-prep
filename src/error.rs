@@ -18,6 +18,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[cfg(any(test, feature = "fixtures"))]
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

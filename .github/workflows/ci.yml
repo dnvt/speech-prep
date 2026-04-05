@@ -50,6 +50,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   package:
     name: Package
     runs-on: ubuntu-latest
