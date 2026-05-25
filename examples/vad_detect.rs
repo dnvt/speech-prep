@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use speech_prep::vad::{NoopVadMetricsCollector, VadConfig, VadDetector, VadMetricsCollector};
 
-fn main() {
+fn main() -> speech_prep::Result<()> {
     let config = VadConfig::default();
     let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
-    let detector = VadDetector::new(config, metrics).expect("VAD init");
+    let detector = VadDetector::new(config, metrics)?;
 
     // Generate 2 seconds of synthetic audio: silence + speech + silence
     let sample_rate = 16_000;
@@ -23,7 +23,7 @@ fn main() {
         audio[i] = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
     }
 
-    let segments = detector.detect(&audio).expect("VAD detection");
+    let segments = detector.detect(&audio)?;
 
     println!("speech-prep: VAD detection example\n");
     println!("Audio: 2.0s at {sample_rate}Hz ({} samples)", audio.len());
@@ -40,4 +40,6 @@ fn main() {
             seg.avg_energy,
         );
     }
+
+    Ok(())
 }

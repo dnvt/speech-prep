@@ -1,22 +1,21 @@
 //! Audio format detection and metadata extraction for the audio pipeline.
 //!
 //! This module provides fast, robust format detection using a hybrid approach:
-//! - **Fast path**: Magic-byte detection for common formats (WAV, FLAC, MP3) -
-//!   <1µs
-//! - **Validation path**: Symphonia probe for complex formats (Opus, `WebM`,
-//!   M4A) - <10ms
+//! - **Fast path**: Magic-byte detection for common formats such as WAV, FLAC,
+//!   and MP3.
+//! - **Validation path**: Symphonia probe for complex formats such as Opus,
+//!   `WebM`, and M4A.
 //!
-//! ## Performance Contract
+//! ## Timing Notes
 //!
-//! - Detection latency: <1ms for 99% of inputs
-//! - Total processing: <10ms including validation
-//! - Zero panics: All byte access bounds-checked
+//! Detection should be cheap, but timing depends on input size, container, and
+//! hardware. Measure before publishing latency claims.
 //!
-//! ## Supported Formats
+//! ## Detected Formats
 //!
 //! - **WAV** (RIFF/PCM): Primary format, instant detection
 //! - **FLAC**: Lossless compression, instant detection
-//! - **MP3**: MPEG-1/2 Layer 3, frame sync validation
+//! - **MP3**: MPEG-1/2 Layer 3, frame sync heuristic
 //! - **Opus**: Ogg container with Opus codec
 //! - **`WebM`**: Matroska container (audio track)
 //! - **M4A/AAC**: MPEG-4 container with AAC codec
@@ -136,16 +135,15 @@ impl FormatDetector {
 
     /// Detect audio format from byte stream using fast magic-byte detection.
     ///
-    /// This is the primary entry point optimized for speed (<1µs for common
-    /// formats). Falls back to Symphonia validation for complex/ambiguous
-    /// formats.
+    /// This is the primary entry point optimized for simple format detection.
+    /// It falls back to Symphonia validation for complex or ambiguous formats.
     ///
     /// # Errors
     ///
     /// Returns `Error::InvalidInput` if:
     /// - Payload is too short for any valid audio format
     /// - Format is unsupported or unrecognized
-    /// - Byte stream is malformed (detected via Symphonia probe)
+    /// - Fallback validation fails for ambiguous formats
     pub fn detect(data: &[u8]) -> Result<AudioMetadata> {
         if data.len() < 4 {
             return Err(Error::InvalidInput(
@@ -162,9 +160,8 @@ impl FormatDetector {
 
     /// Detect format and extract full metadata using Symphonia probe.
     ///
-    /// This method provides comprehensive metadata extraction but is slower
-    /// (~10ms). Use when full audio properties are needed (channels, sample
-    /// rate, duration).
+    /// Use when full audio properties are needed (channels, sample rate,
+    /// duration). Measure on target hardware before publishing latency numbers.
     ///
     /// # Errors
     ///
@@ -198,7 +195,7 @@ impl FormatDetector {
             }
         }
 
-        // MP3: frame sync heuristic, validated by Symphonia downstream
+        // MP3: frame sync heuristic. Use detect_with_metadata for validation.
         if len >= 2 {
             if let (Some(&first), Some(&second)) = (data.first(), data.get(1)) {
                 if first == 0xFF && (second & 0xE0) == 0xE0 {
