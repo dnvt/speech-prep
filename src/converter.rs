@@ -12,11 +12,11 @@
 //! 3. **Resampling**: Convert to 16kHz standard rate (linear interpolation)
 //! 4. **Channel Mixing**: Downmix to mono (simple averaging)
 //!
-//! ## Performance Contract
+//! ## Timing Notes
 //!
-//! - **Target Latency**: <10ms for 3-second audio clip
-//! - **Memory**: Streaming-friendly, minimal allocations
-//! - **Quality**: RMS error <0.01, zero clipping
+//! Conversion metadata records per-stage timings. Treat any latency number as a
+//! measurement for a specific build, input, and machine, not as a crate-wide
+//! guarantee.
 //!
 //! ## Example
 //!
@@ -97,14 +97,10 @@ pub struct ConversionMetadata {
 }
 
 impl ConversionMetadata {
-    /// Check if any stage exceeded expected latency budget.
+    /// Check if any stage exceeded a conservative local latency threshold.
     ///
-    /// Expected budget breakdown for 3s clip:
-    /// - Detection: <1ms
-    /// - Decoding: <3ms
-    /// - Resampling: <5ms
-    /// - Mixing: <1ms
-    /// - **Total: <10ms**
+    /// This helper flags work that may deserve profiling. Treat it as a
+    /// diagnostic hint, not a benchmark result.
     #[must_use]
     pub fn has_performance_issue(&self) -> bool {
         self.conversion_time_ms > 10.0
@@ -207,8 +203,8 @@ impl AudioFormatConverter {
     ///
     /// # Performance
     ///
-    /// Target: <10ms for 3-second audio clip on reference hardware.
-    /// Actual timing captured in `ConversionMetadata.conversion_time_ms`.
+    /// Actual timing is captured in `ConversionMetadata.conversion_time_ms`.
+    /// Benchmark on your target hardware before making latency claims.
     ///
     /// # Example
     ///
