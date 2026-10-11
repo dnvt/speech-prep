@@ -57,7 +57,9 @@ use speech_prep::{AudioFormatConverter, Chunker, VadConfig, VadDetector};
 
 fn main() -> speech_prep::Result<()> {
     let audio = AudioFormatConverter::convert_file("recording.flac")?; // 16 kHz mono
-    let segments = VadDetector::new(VadConfig::default())?.detect(&audio.samples)?;
+    let vad = VadDetector::new(VadConfig::default())?;
+    let mut segments = vad.detect(&audio.samples)?;
+    segments.extend(vad.flush()?); // close a segment that runs to the end
     let chunks = Chunker::default().chunk(&audio.samples, 16_000, &segments)?;
     println!("{} speech segments, {} chunks", segments.len(), chunks.len());
     Ok(())

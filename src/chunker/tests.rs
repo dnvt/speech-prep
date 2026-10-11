@@ -839,3 +839,24 @@ fn test_wall_clock_timestamps() {
         "Total samples across chunks should match audio buffer"
     );
 }
+
+#[test]
+fn test_overlapping_segments_are_merged() {
+    let segment = |start_ms: u64, end_ms: u64| SpeechChunk {
+        start_time: AudioTimestamp::EPOCH.add_duration(AudioDuration::from_millis(start_ms)),
+        end_time: AudioTimestamp::EPOCH.add_duration(AudioDuration::from_millis(end_ms)),
+        confidence: 0.9,
+        avg_energy: 0.3,
+        frame_count: 10,
+    };
+    let audio = vec![0.1f32; 16_000];
+    // Out of order and overlapping.
+    let segments = [segment(600, 900), segment(200, 500), segment(450, 650)];
+
+    let chunks = Chunker::default().chunk(&audio, 16_000, &segments).unwrap();
+    let total: usize = chunks.iter().map(|c| c.samples.len()).sum();
+    assert_eq!(total, audio.len());
+    for pair in chunks.windows(2) {
+        assert_eq!(pair[0].end_time, pair[1].start_time);
+    }
+}

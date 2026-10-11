@@ -53,3 +53,44 @@ fn opus_is_reported_as_unsupported() {
     let err = AudioFormatConverter::convert_file(fixture("tone.opus")).unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
 }
+
+#[test]
+fn chained_ogg_with_same_layout_decodes_both_streams() {
+    let one = std::fs::read(fixture("tone.ogg")).unwrap();
+    let single = AudioFormatConverter::convert_to_standard(&one).unwrap();
+
+    let chained = [one.as_slice(), one.as_slice()].concat();
+    let both = AudioFormatConverter::convert_to_standard(&chained).unwrap();
+    assert_eq!(both.samples.len(), 2 * single.samples.len());
+}
+
+#[test]
+fn layout_change_mid_stream_is_an_error() {
+    let read = |name| std::fs::read(fixture(name)).unwrap();
+
+    // Two chained Ogg streams at 44.1 and 22.05 kHz.
+    let chained = [read("tone.ogg"), read("tone-22k.ogg")].concat();
+    let err = AudioFormatConverter::convert_to_standard(&chained).unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+
+    // A stereo MP3 followed by a mono one: half the frames fail to decode.
+    let mixed = [read("tone.mp3"), read("tone-mono.mp3")].concat();
+    assert!(AudioFormatConverter::convert_to_standard(&mixed).is_err());
+}
+
+#[test]
+fn metadata_detection_agrees_with_decoder() {
+    use speech_prep::format::FormatDetector;
+    for (name, format, rate) in [
+        ("tone.flac", AudioFormat::Flac, 44_100),
+        ("tone.mp3", AudioFormat::Mp3, 44_100),
+        ("tone.m4a", AudioFormat::Aac, 44_100),
+        ("tone.ogg", AudioFormat::Vorbis, 44_100),
+        ("tone.opus", AudioFormat::Opus, 48_000),
+    ] {
+        let bytes = std::fs::read(fixture(name)).unwrap();
+        let meta = FormatDetector::detect_with_metadata(&bytes).unwrap();
+        assert_eq!(meta.format, format, "{name}");
+        assert_eq!(meta.sample_rate, Some(rate), "{name}");
+    }
+}

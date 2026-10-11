@@ -10,9 +10,8 @@
 use std::io::Cursor;
 
 use symphonia::core::codecs::{
-    CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_OPUS, CODEC_TYPE_PCM_F32LE,
-    CODEC_TYPE_PCM_F64LE, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S24LE, CODEC_TYPE_PCM_S32LE,
-    CODEC_TYPE_PCM_U8, CODEC_TYPE_VORBIS,
+    CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL, CODEC_TYPE_OPUS,
+    CODEC_TYPE_VORBIS,
 };
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -163,17 +162,20 @@ impl FormatDetector {
                 Error::InvalidInput(format!("unrecognized or malformed audio: {err}"))
             })?;
 
+        // Same track choice as the decoder: the first track with a codec.
         let params = &probed
             .format
-            .default_track()
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
             .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?
             .codec_params;
 
+        let is_pcm = symphonia::default::get_codecs()
+            .get_codec(params.codec)
+            .is_some_and(|codec| codec.short_name.starts_with("pcm"));
         let format = match params.codec {
-            CODEC_TYPE_PCM_U8 | CODEC_TYPE_PCM_S16LE | CODEC_TYPE_PCM_S24LE
-            | CODEC_TYPE_PCM_S32LE | CODEC_TYPE_PCM_F32LE | CODEC_TYPE_PCM_F64LE => {
-                AudioFormat::WavPcm
-            }
+            _ if is_pcm => AudioFormat::WavPcm,
             CODEC_TYPE_FLAC => AudioFormat::Flac,
             CODEC_TYPE_MP3 => AudioFormat::Mp3,
             CODEC_TYPE_OPUS => AudioFormat::Opus,
