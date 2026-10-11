@@ -8,6 +8,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The noise floor's slow rise during speech now has the same time constant
+  (5 s) at any frame hop. It was a fixed per-frame factor, so with
+  `frame_overlap: 0.75` steady noise under speech was absorbed in half the
+  time, and with no overlap in twice the time. Defaults are unchanged.
 - `NoiseReducer` now carries the last frame of the stream as real left-hand
   context and keeps its STFT frames on one hop grid across calls, so a
   continuous signal split across calls (at any sample, in blocks of any size)
