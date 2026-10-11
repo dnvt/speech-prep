@@ -54,9 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.87
+      # Edition 2024 resolves dependencies against rust-version.
       - run: cargo generate-lockfile
-        env:
-          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - run: cargo check --all-targets
 
   package:

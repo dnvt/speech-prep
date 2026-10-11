@@ -110,9 +110,8 @@ prints per-stage timings for 10 s of synthetic audio on your machine.
 
 ## Minimum Rust version
 
-1.87. With a fresh lockfile some transitive dependencies need a newer
-compiler; on 1.87, resolve with
-`CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo update`.
+1.87. The crate uses edition 2024, so Cargo picks dependency versions that
+build on your compiler.
 
 ## Contributing
 

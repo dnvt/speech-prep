@@ -1,11 +1,10 @@
 //! Core VAD detection engine with dual-metric analysis.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::error::{Error, Result};
 use crate::time::{AudioDuration, AudioInstant, AudioTimestamp};
-use parking_lot::Mutex;
 use realfft::{RealFftPlanner, RealToComplex};
 
 use super::config::VadConfig;
@@ -48,7 +47,7 @@ pub struct VadDetector {
 
 impl fmt::Debug for VadDetector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let processed_samples = self.state.lock().processed_samples;
+        let processed_samples = self.lock_state().processed_samples;
         f.debug_struct("VadDetector")
             .field("config", &self.config)
             .field("window_length", &self.window.len())
@@ -109,11 +108,18 @@ impl VadDetector {
         &self.config
     }
 
+    /// Lock the streaming state. A panic while holding the lock cannot leave
+    /// the state half-updated in a way that matters more than restarting
+    /// would, so poisoning is ignored.
+    fn lock_state(&self) -> MutexGuard<'_, DetectorState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Start sample of the speech segment still open at the end of the last
     /// [`detect`](Self::detect) call, if any.
     #[must_use]
     pub fn active_segment_start_sample(&self) -> Option<usize> {
-        let state = self.state.lock();
+        let state = self.lock_state();
         state
             .active_segment
             .as_ref()
@@ -125,7 +131,7 @@ impl VadDetector {
     pub fn reset(&mut self, stream_start_time: AudioTimestamp) {
         self.config.stream_start_time = stream_start_time;
         let bins = self.fft.make_output_vec().len();
-        *self.state.lock() = DetectorState::new(&self.config, bins);
+        *self.lock_state() = DetectorState::new(&self.config, bins);
     }
 
     /// Detect speech in the next block of samples from the stream.
@@ -140,7 +146,7 @@ impl VadDetector {
     /// Returns [`Error::Processing`] if framing or the FFT fails.
     pub fn detect(&self, samples: &[f32]) -> Result<Vec<SpeechChunk>> {
         let detection_start = AudioInstant::now();
-        let mut detector_state = self.state.lock();
+        let mut detector_state = self.lock_state();
 
         let chunk_start_sample = detector_state.processed_samples;
         let chunk_end_sample = chunk_start_sample + samples.len();

@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use crate::chunker::{apply_overlaps, Chunker, ProcessedChunk};
+use crate::chunker::{Chunker, ProcessedChunk, apply_overlaps};
 use crate::converter::{AudioFormatConverter, STANDARD_SAMPLE_RATE};
 use crate::error::{Error, Result};
 use crate::preprocessing::{

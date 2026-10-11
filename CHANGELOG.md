@@ -36,6 +36,8 @@ uses [Semantic Versioning](https://semver.org/).
 - The default VAD energy gate is 10x lower (0.002 instead of 0.02). The old
   value ignored voiced audio peaking at -20 dBFS.
 - Channels are mixed to mono before resampling instead of after.
+- Edition 2024. Cargo now resolves dependencies against `rust-version`, so
+  1.87 builds without pinning anything.
 - Library code no longer logs at `info`/`warn` on every call or warns when a
   stage takes longer than a fixed wall-clock budget.
 
@@ -62,7 +64,8 @@ uses [Semantic Versioning](https://semver.org/).
   `ConversionMetadata::has_performance_issue`,
   `AudioFormat::is_container_format`, `ProcessingResult::backpressure_active`,
   and `StageLatencies::broadcasting_avg`.
-- `glob` and `serde_json` dependencies; `hound` is now dev-only.
+- `glob`, `serde_json`, `parking_lot`, and `rand` dependencies; `hound` is
+  now dev-only.
 
 ## [0.1.4] - 2026-04-05
 

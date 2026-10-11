@@ -6,7 +6,7 @@ mod resampler;
 use std::io::Cursor;
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -97,7 +97,7 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
             Err(err) => {
                 return Err(Error::InvalidInput(format!(
                     "failed to decode audio: {err}"
-                )))
+                )));
             }
         };
 
