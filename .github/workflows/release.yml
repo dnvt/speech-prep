@@ -87,6 +87,8 @@ jobs:
         with:
           name: release-notes
           path: release-notes.md
+          # Re-running this job replaces the notes from the earlier attempt.
+          overwrite: true
 
       - run: cargo test
       - run: cargo test --features opus
