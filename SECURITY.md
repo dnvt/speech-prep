@@ -1,22 +1,19 @@
 # Security Policy
 
-`speech-prep` is a local audio preprocessing crate, not a hosted service. The
-main risks are malformed audio inputs, privacy mistakes around user audio, and
-incorrect documentation about supported formats.
+`speech-prep` parses untrusted audio files, so malformed input that causes
+a panic, a hang, or excessive memory use is treated as a security issue.
 
-## Supported Versions
+## Supported versions
 
-Security fixes target the current `main` branch and the latest crates.io release.
+Fixes go into the latest release on crates.io and `main`.
 
-## Reporting A Security Issue
+## Reporting
 
-Do not attach private audio, private transcripts, API keys, or proprietary
-datasets to public issues.
+Please use GitHub's
+[private vulnerability reporting](https://github.com/dnvt/speech-prep/security/advisories/new)
+rather than a public issue. Include a minimal input file that reproduces
+the problem if you can. Don't send recordings of real people; a generated
+or truncated file is almost always enough.
 
-For security-sensitive reports, use GitHub private vulnerability reporting if it
-is available for this repository. If it is not available, open a public issue
-with only a short non-sensitive summary and ask for a private contact path.
-
-For normal decoding bugs, crashes, and format-support gaps, open a regular
-GitHub issue with the command you ran, the Rust version, the file format, sample
-rate, channel count, and whether the audio is public or synthetic.
+For ordinary bugs, open a regular issue with the Rust version, the input
+format, sample rate, and channel count.

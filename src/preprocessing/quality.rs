@@ -1,318 +1,158 @@
-//! Audio quality assessment with SNR estimation and spectral analysis.
+//! Simple signal-quality metrics for a block of audio.
 //!
-//! This module provides multi-dimensional quality metrics for audio
-//! preprocessing validation.
-//!
-//! # Metrics
-//!
-//! - **SNR (Signal-to-Noise Ratio)**: Measures signal power vs noise floor (dB)
-//! - **RMS Energy**: Root-mean-square energy as baseline quality indicator
-//! - **Spectral Centroid**: Weighted average frequency (brightness measure)
-//! - **Quality Score**: Unified score in [0.0, 1.0] combining all metrics
-//!
-//! # Performance
-//!
-//! - **Target**: <10ms per second of 16 kHz audio
-//! - **Memory**: Minimal allocations (reuses frame buffers)
-//!
-//! # Example
-//!
-//! ```rust,no_run
+//! ```
 //! use speech_prep::preprocessing::QualityAssessor;
 //!
-//! # fn main() -> speech_prep::error::Result<()> {
-//! let assessor = QualityAssessor::new(16000);
-//! let audio_samples = vec![0.5f32; 16000]; // 1 second at 16 kHz
+//! # fn main() -> speech_prep::Result<()> {
+//! let audio: Vec<f32> = (0..16_000)
+//!     .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin())
+//!     .collect();
 //!
-//! let metrics = assessor.assess(&audio_samples)?;
-//! assert!(metrics.snr_db.is_finite());
+//! let metrics = QualityAssessor::new(16_000).assess(&audio)?;
+//! assert!((metrics.spectral_centroid - 1_000.0).abs() < 50.0);
 //! # Ok(())
 //! # }
 //! ```
 
-use crate::error::{Error, Result};
-use crate::time::{AudioDuration, AudioInstant};
-use tracing::{debug, trace};
+use realfft::RealFftPlanner;
 
-/// Quality metrics for audio assessment.
-///
-/// All metrics are computed for a single audio chunk.
+use crate::error::{Error, Result};
+
+/// Metrics returned by [`QualityAssessor::assess`].
 #[derive(Debug, Clone, Copy)]
 pub struct QualityMetrics {
-    /// Signal-to-noise ratio in decibels [0.0, 60.0]
+    /// Overall RMS divided by the RMS of the quietest 10% of 16 ms frames,
+    /// in dB, clamped to `[0, 60]`. A rough SNR that assumes the input
+    /// contains some pauses.
     pub snr_db: f32,
-    /// RMS energy level [0.0, 1.0]
+    /// RMS level of the whole block.
     pub energy: f32,
-    /// Spectral centroid in Hz [0.0, `sample_rate/2`]
+    /// Power-weighted mean frequency in Hz. Speech is typically 500-2500 Hz;
+    /// much higher values suggest hiss.
     pub spectral_centroid: f32,
-    /// Unified quality score [0.0, 1.0] (higher is better)
+    /// Heuristic score in `[0, 1]`: 60% SNR (0-60 dB) and 40% level
+    /// (-50 to -20 dBFS RMS). Useful for ranking or gating clips, not as an
+    /// absolute measure.
     pub quality_score: f32,
 }
 
-/// Audio quality assessor with configurable sample rate.
-///
-/// Computes multi-dimensional quality metrics for audio chunks,
-/// providing objective measures for quality gates and filtering.
+/// Computes [`QualityMetrics`].
 #[derive(Debug, Clone, Copy)]
 pub struct QualityAssessor {
     sample_rate: u32,
 }
 
+/// Frame length for the SNR and spectral estimates.
+const FRAME: usize = 256;
+const SPECTRUM_FRAME: usize = 512;
+
 impl QualityAssessor {
-    /// Creates a new quality assessor for the given sample rate.
-    ///
-    /// # Arguments
-    ///
-    /// - `sample_rate`: Audio sample rate in Hz (e.g., 16000)
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use speech_prep::preprocessing::QualityAssessor;
-    ///
-    /// let assessor = QualityAssessor::new(16000);
-    /// ```
+    /// Create an assessor for audio at `sample_rate` Hz.
+    #[must_use]
     pub fn new(sample_rate: u32) -> Self {
         Self { sample_rate }
     }
 
-    /// Assesses audio quality for the given samples.
-    ///
-    /// Computes SNR, energy, spectral centroid, and unified quality score.
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Audio samples to assess (must not be empty)
-    ///
-    /// # Returns
-    ///
-    /// Quality metrics including SNR (dB), energy, spectral centroid (Hz),
-    /// and unified quality score [0.0, 1.0].
+    /// Measure `samples`.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if samples are empty.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use speech_prep::preprocessing::QualityAssessor;
-    ///
-    /// # fn main() -> speech_prep::error::Result<()> {
-    /// let assessor = QualityAssessor::new(16000);
-    /// let audio = vec![0.5f32; 16000];
-    /// let metrics = assessor.assess(&audio)?;
-    /// assert!((0.0..=1.0).contains(&metrics.quality_score));
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns [`Error::InvalidInput`] if `samples` is empty, and
+    /// [`Error::Processing`] if the FFT fails.
     pub fn assess(self, samples: &[f32]) -> Result<QualityMetrics> {
-        trace!(sample_count = samples.len(), "Assessing audio quality");
-
         if samples.is_empty() {
-            return Err(Error::InvalidInput("Cannot assess empty audio".into()));
+            return Err(Error::InvalidInput("cannot assess empty audio".into()));
         }
 
-        let processing_start = AudioInstant::now();
-        let energy = Self::calculate_rms(samples);
-        let snr_db = Self::calculate_snr(samples, energy)?;
-        let spectral_centroid = self.calculate_spectral_centroid(samples)?;
-        let quality_score = self.aggregate_score(snr_db, energy, spectral_centroid);
+        let energy = rms(samples);
+        let snr_db = Self::estimate_snr(samples, energy);
+        let spectral_centroid = self.spectral_centroid(samples)?;
 
-        debug!(
-            snr_db,
-            energy, spectral_centroid, quality_score, "Audio quality metrics computed"
-        );
+        let snr_score = (snr_db / 60.0).clamp(0.0, 1.0);
+        let level_db = 20.0 * energy.max(1e-10).log10();
+        let level_score = ((level_db + 50.0) / 30.0).clamp(0.0, 1.0);
+        let quality_score = 0.6f32.mul_add(snr_score, 0.4 * level_score);
 
-        let metrics = QualityMetrics {
+        tracing::trace!(
             snr_db,
             energy,
             spectral_centroid,
             quality_score,
-        };
-        let _latency = elapsed_duration(processing_start);
+            "assessed audio quality"
+        );
 
-        Ok(metrics)
+        Ok(QualityMetrics {
+            snr_db,
+            energy,
+            spectral_centroid,
+            quality_score,
+        })
     }
 
-    /// Calculates RMS (root-mean-square) energy of audio samples.
-    ///
-    /// This is a static method that can be called without an assessor instance.
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Audio samples (must not be empty)
-    ///
-    /// # Returns
-    ///
-    /// RMS energy in range [0.0, 1.0] for normalized audio
-    fn calculate_rms(samples: &[f32]) -> f32 {
-        let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
-        let mean_square = sum_squares / samples.len() as f32;
-        mean_square.sqrt()
-    }
-
-    /// Calculates signal-to-noise ratio (SNR) in decibels.
-    ///
-    /// Estimates noise floor from the quietest 10% of frames,
-    /// then computes dB ratio between signal RMS and noise floor.
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Audio samples
-    /// - `signal_rms`: Pre-computed RMS energy of the signal
-    ///
-    /// # Returns
-    ///
-    /// SNR in dB, clamped to [0.0, 60.0] for practical purposes
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::AudioProcessing` if insufficient frames for estimation
-    fn calculate_snr(samples: &[f32], signal_rms: f32) -> Result<f32> {
-        // Compute frame energies (256 samples per frame)
-        let frame_energies = Self::frame_energy(samples);
-
-        let mut valid_energies: Vec<f32> =
-            frame_energies.into_iter().filter(|x| !x.is_nan()).collect();
-
-        if valid_energies.is_empty() {
-            return Err(Error::Processing(
-                "All frame energies are NaN; cannot estimate noise floor".into(),
-            ));
+    fn estimate_snr(samples: &[f32], signal_rms: f32) -> f32 {
+        if signal_rms < 1e-6 {
+            return 0.0;
         }
 
-        valid_energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut frames: Vec<f32> = samples.chunks(FRAME).map(rms).collect();
+        frames.sort_by(f32::total_cmp);
+        let quietest = &frames[..(frames.len() / 10).max(1)];
+        let noise_floor = quietest.iter().sum::<f32>() / quietest.len() as f32;
 
-        // Quietest 10% of frames as noise floor estimate
-        let noise_frame_count = (valid_energies.len() / 10).max(1);
-        let noise_frames = valid_energies
-            .get(0..noise_frame_count)
-            .ok_or_else(|| Error::Processing("Insufficient frames for noise estimation".into()))?;
+        if noise_floor < 1e-10 {
+            return 60.0;
+        }
+        (20.0 * (signal_rms / noise_floor).log10()).clamp(0.0, 60.0)
+    }
 
-        let noise_floor = noise_frames.iter().sum::<f32>() / noise_frames.len() as f32;
+    /// Average the power spectrum over Hann-windowed frames and return its
+    /// centroid.
+    fn spectral_centroid(self, samples: &[f32]) -> Result<f32> {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(SPECTRUM_FRAME);
+        let mut input = fft.make_input_vec();
+        let mut spectrum = fft.make_output_vec();
+        let mut power = vec![0.0f32; spectrum.len()];
 
-        if signal_rms < 1e-6 {
+        let window: Vec<f32> = (0..SPECTRUM_FRAME)
+            .map(|n| {
+                let phase = 2.0 * std::f32::consts::PI * n as f32 / SPECTRUM_FRAME as f32;
+                0.5f32.mul_add(-phase.cos(), 0.5)
+            })
+            .collect();
+
+        for frame in samples.chunks(SPECTRUM_FRAME) {
+            input.fill(0.0);
+            for ((dst, &s), &w) in input.iter_mut().zip(frame).zip(&window) {
+                *dst = s * w;
+            }
+            fft.process(&mut input, &mut spectrum)
+                .map_err(|e| Error::Processing(format!("FFT failed: {e}")))?;
+            for (p, bin) in power.iter_mut().zip(&spectrum) {
+                *p += bin.norm_sqr();
+            }
+        }
+
+        let total: f32 = power.iter().sum();
+        if total < 1e-12 {
             return Ok(0.0);
         }
 
-        if noise_floor < 1e-10 {
-            return Ok(60.0);
-        }
-
-        let snr = 20.0 * (signal_rms / noise_floor).log10();
-        Ok(snr.clamp(0.0, 60.0))
-    }
-
-    /// Computes RMS energy for each frame of audio.
-    ///
-    /// Divides audio into fixed-size frames and computes RMS for each.
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Audio samples
-    ///
-    /// # Returns
-    ///
-    /// Vector of RMS energies, one per frame
-    fn frame_energy(samples: &[f32]) -> Vec<f32> {
-        const FRAME_SIZE: usize = 256;
-        samples
-            .chunks(FRAME_SIZE)
-            .map(|frame| {
-                let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
-                (sum_sq / frame.len() as f32).sqrt()
-            })
-            .collect()
-    }
-
-    /// Calculates spectral centroid (brightness measure) in Hz.
-    ///
-    /// Computes weighted average frequency from magnitude spectrum.
-    /// Uses simplified time-domain approximation (not full FFT).
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Audio samples (should be ≥512 for meaningful result)
-    ///
-    /// # Returns
-    ///
-    /// Spectral centroid in Hz, clamped to [0.0, `sample_rate/2`]
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::AudioProcessing` if samples are too short
-    ///
-    /// # Note
-    ///
-    /// This is a simplified implementation. Full FFT-based spectral
-    /// centroid can be added in the future for more accurate results.
-    fn calculate_spectral_centroid(self, samples: &[f32]) -> Result<f32> {
-        // For very short audio, return midpoint frequency
-        if samples.len() < 512 {
-            return Ok(self.sample_rate as f32 / 4.0);
-        }
-
-        // Use first 512 samples for spectral analysis
-        let window = samples.get(0..512).ok_or_else(|| {
-            Error::Processing("Insufficient samples for spectral analysis".into())
-        })?;
-
-        // Time-domain approximation of spectral centroid
-        let (magnitude_sum, weighted_sum) =
-            window
-                .iter()
-                .enumerate()
-                .fold((0.0f32, 0.0f32), |(mag_acc, weighted_acc), (i, &s)| {
-                    let magnitude = s.abs();
-                    (
-                        mag_acc + magnitude,
-                        magnitude.mul_add(i as f32, weighted_acc),
-                    )
-                });
-
-        if magnitude_sum < 1e-10 {
-            return Ok(self.sample_rate as f32 / 4.0);
-        }
-
-        let centroid_bin = weighted_sum / magnitude_sum;
-        let centroid_hz = (centroid_bin / 512.0) * (self.sample_rate as f32 / 2.0);
-        Ok(centroid_hz.clamp(0.0, self.sample_rate as f32 / 2.0))
-    }
-
-    /// Aggregates individual metrics into unified quality score [0.0, 1.0].
-    ///
-    /// Uses weighted combination:
-    /// - 50% SNR (signal clarity)
-    /// - 30% Energy (signal strength)
-    /// - 20% Spectral centroid (frequency content)
-    ///
-    /// # Arguments
-    ///
-    /// - `snr_db`: Signal-to-noise ratio in dB
-    /// - `energy`: RMS energy
-    /// - `spectral_centroid`: Spectral centroid in Hz
-    ///
-    /// # Returns
-    ///
-    /// Quality score in [0.0, 1.0], where 1.0 is perfect quality
-    fn aggregate_score(self, snr_db: f32, energy: f32, spectral_centroid: f32) -> f32 {
-        let snr_score = (snr_db / 60.0).clamp(0.0, 1.0);
-        let energy_score = (energy / 0.5).clamp(0.0, 1.0);
-        let centroid_score = (spectral_centroid / (self.sample_rate as f32 / 2.0)).clamp(0.0, 1.0);
-
-        // 50% SNR, 30% energy, 20% spectral
-        let score = 0.5f32.mul_add(
-            snr_score,
-            0.3f32.mul_add(energy_score, 0.2 * centroid_score),
-        );
-
-        score.clamp(0.0, 1.0)
+        let bin_hz = self.sample_rate as f32 / SPECTRUM_FRAME as f32;
+        let weighted: f32 = power
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| k as f32 * bin_hz * p)
+            .sum();
+        Ok(weighted / total)
     }
 }
 
-fn elapsed_duration(start: AudioInstant) -> AudioDuration {
-    AudioInstant::now().duration_since(start)
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
 #[cfg(test)]
@@ -329,8 +169,8 @@ mod tests {
         let mut samples = vec![0.0f32; 16000];
 
         // Add strong signal in middle 50% of audio (8000 samples)
-        for i in 4000..12000 {
-            samples[i] = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5;
+        for (i, sample) in samples.iter_mut().enumerate().take(12000).skip(4000) {
+            *sample = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5;
         }
         // First and last 25% remain silent (noise floor)
 
@@ -479,9 +319,9 @@ mod tests {
 
         let metrics = assessor.assess(&short_audio).unwrap();
 
-        // Should not panic, should return valid metrics
         assert!((0.0..=1.0).contains(&metrics.quality_score));
-        assert!(metrics.spectral_centroid > 0.0);
+        // A constant signal has all its energy near 0 Hz.
+        assert!(metrics.spectral_centroid < 100.0);
     }
 
     #[test]
@@ -508,5 +348,20 @@ mod tests {
             "Expected low quality for very quiet audio, got {:.2}",
             metrics.quality_score
         );
+    }
+
+    #[test]
+    fn test_spectral_centroid_tracks_frequency() {
+        let assessor = QualityAssessor::new(16000);
+        for freq in [300.0f32, 1_000.0, 3_000.0] {
+            let tone: Vec<f32> = (0..16000)
+                .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 16000.0).sin() * 0.5)
+                .collect();
+            let centroid = assessor.assess(&tone).unwrap().spectral_centroid;
+            assert!(
+                (centroid - freq).abs() < freq * 0.05,
+                "{freq} Hz tone gave centroid {centroid:.1} Hz"
+            );
+        }
     }
 }

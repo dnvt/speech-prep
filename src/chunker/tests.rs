@@ -510,7 +510,7 @@ fn test_overlap_with_silence_gaps() {
 }
 
 #[test]
-fn test_dedupe_utilities() {
+fn test_total_samples_with_overlap() {
     let chunk = ProcessedChunk {
         samples: vec![1.0, 2.0, 3.0, 4.0, 5.0],
         start_boundary: ChunkBoundary::SpeechStart,
@@ -525,9 +525,6 @@ fn test_dedupe_utilities() {
         overlap_next: Some(vec![5.0]),
         overlap_ms: 10,
     };
-
-    // samples_without_overlap returns core samples
-    assert_eq!(chunk.samples_without_overlap(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
 
     // total_samples_with_overlap calculates total including overlaps
     let total = chunk.total_samples_with_overlap();
@@ -564,7 +561,7 @@ fn test_reconstruction_from_deduplicated_chunks() {
     // Reconstruct audio by concatenating deduplicated chunks
     let mut reconstructed = Vec::new();
     for chunk in &chunks {
-        let core_samples = chunk.samples_without_overlap();
+        let core_samples = &chunk.samples[..];
         reconstructed.extend_from_slice(core_samples);
     }
 
@@ -604,9 +601,7 @@ fn test_reconstruction_with_silence_gaps() {
     }
 
     // Silence: 700ms (11200 samples)
-    for _ in 0..11200 {
-        original_audio.push(0.0);
-    }
+    original_audio.extend(std::iter::repeat_n(0.0f32, 11200));
 
     // Speech 2: 400ms (6400 samples)
     for i in 0..6400 {
@@ -638,7 +633,7 @@ fn test_reconstruction_with_silence_gaps() {
     // Reconstruct
     let mut reconstructed = Vec::new();
     for chunk in &chunks {
-        reconstructed.extend_from_slice(chunk.samples_without_overlap());
+        reconstructed.extend_from_slice(&chunk.samples[..]);
     }
 
     // Verify
@@ -668,9 +663,7 @@ fn test_quality_metrics_in_speech_chunks() {
     let mut audio = Vec::new();
 
     // Leading silence: 200ms (3200 samples) with noise
-    for _ in 0..3200 {
-        audio.push(0.01); // Noise floor
-    }
+    audio.extend(std::iter::repeat_n(0.01f32, 3200));
 
     // Speech: 800ms (12800 samples) with higher amplitude
     for i in 0..12800 {
@@ -741,9 +734,7 @@ fn test_quality_metrics_with_clipped_audio() {
     let mut audio = Vec::new();
 
     // Leading silence: 200ms (3200 samples)
-    for _ in 0..3200 {
-        audio.push(0.01);
-    }
+    audio.extend(std::iter::repeat_n(0.01f32, 3200));
 
     // Speech with clipping: 800ms (12800 samples)
     for i in 0..12800 {
@@ -791,9 +782,7 @@ fn test_wall_clock_timestamps() {
     let mut audio = Vec::new();
 
     // Silence: 200ms (3200 samples)
-    for _ in 0..3200 {
-        audio.push(0.001);
-    }
+    audio.extend(std::iter::repeat_n(0.001f32, 3200));
 
     // Speech: 600ms (9600 samples)
     for i in 0..9600 {
@@ -802,9 +791,7 @@ fn test_wall_clock_timestamps() {
     }
 
     // Silence: 200ms (3200 samples)
-    for _ in 0..3200 {
-        audio.push(0.001);
-    }
+    audio.extend(std::iter::repeat_n(0.001f32, 3200));
 
     // VAD segments with wall-clock timestamps (absolute times)
     let vad_segments = vec![SpeechChunk {
@@ -851,4 +838,25 @@ fn test_wall_clock_timestamps() {
         audio.len(),
         "Total samples across chunks should match audio buffer"
     );
+}
+
+#[test]
+fn test_overlapping_segments_are_merged() {
+    let segment = |start_ms: u64, end_ms: u64| SpeechChunk {
+        start_time: AudioTimestamp::EPOCH.add_duration(AudioDuration::from_millis(start_ms)),
+        end_time: AudioTimestamp::EPOCH.add_duration(AudioDuration::from_millis(end_ms)),
+        confidence: 0.9,
+        avg_energy: 0.3,
+        frame_count: 10,
+    };
+    let audio = vec![0.1f32; 16_000];
+    // Out of order and overlapping.
+    let segments = [segment(600, 900), segment(200, 500), segment(450, 650)];
+
+    let chunks = Chunker::default().chunk(&audio, 16_000, &segments).unwrap();
+    let total: usize = chunks.iter().map(|c| c.samples.len()).sum();
+    assert_eq!(total, audio.len());
+    for pair in chunks.windows(2) {
+        assert_eq!(pair[0].end_time, pair[1].start_time);
+    }
 }

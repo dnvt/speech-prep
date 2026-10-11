@@ -1,61 +1,62 @@
-//! # speech-prep
+//! Speech-focused audio preprocessing.
 //!
-//! Speech-focused audio preprocessing for Rust.
+//! `speech-prep` turns an audio file or stream into clean, 16 kHz mono
+//! chunks that line up with speech, ready for a speech model or a scoring
+//! step. Each stage is usable on its own:
 //!
-//! - Voice activity detection (dual-metric: energy + spectral flux)
-//! - Audio format detection plus WAV decoding to 16kHz mono PCM
-//! - Preprocessing (DC removal, high-pass filter, noise reduction, normalization)
-//! - Speech-aligned chunking with overlap handling
-//! - Quality assessment metrics
+//! | Stage | Type |
+//! |-------|------|
+//! | Decode WAV, AIFF, FLAC, ALAC, MP3, AAC, Vorbis to 16 kHz mono | [`converter::AudioFormatConverter`] |
+//! | Voice activity detection | [`VadDetector`] |
+//! | Speech-aligned chunking with overlap | [`Chunker`] |
+//! | DC removal and high-pass filter | [`preprocessing::DcHighPassFilter`] |
+//! | Stationary noise reduction | [`preprocessing::NoiseReducer`] |
+//! | Loudness normalization | [`preprocessing::Normalizer`] |
+//! | Quality metrics | [`preprocessing::QualityAssessor`] |
 //!
-//! ## Usage
+//! [`Pipeline`] wires decoding, VAD, chunking, and cleanup together.
 //!
-//! ```rust
-//! use std::sync::Arc;
-//! use speech_prep::{NoopVadMetricsCollector, VadConfig, VadDetector, VadMetricsCollector};
+//! # Example
 //!
-//! # fn main() -> Result<(), speech_prep::Error> {
-//! let config = VadConfig::default();
-//! let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
-//! let detector = VadDetector::new(config, metrics)?;
+//! ```no_run
+//! use speech_prep::Pipeline;
 //!
-//! let audio_samples = vec![0.0; 16_000];
-//! let _segments = detector.detect(&audio_samples)?;
+//! # fn main() -> speech_prep::Result<()> {
+//! let bytes = std::fs::read("recording.wav")?;
+//!
+//! let mut pipeline = Pipeline::new()?;
+//! let mut chunks = pipeline.process_bytes(&bytes)?.chunks;
+//! chunks.extend(pipeline.flush()?.chunks);
+//!
+//! for chunk in chunks.iter().filter(|c| c.is_speech()) {
+//!     println!("{} - {}: {} samples", chunk.start_time, chunk.end_time, chunk.samples.len());
+//! }
 //! # Ok(())
 //! # }
 //! ```
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
-#![cfg_attr(test, allow(clippy::expect_used))]
-#![cfg_attr(test, allow(clippy::panic))]
-#![cfg_attr(test, allow(clippy::indexing_slicing))]
-#![cfg_attr(test, allow(clippy::print_stdout))]
-#![cfg_attr(test, allow(clippy::float_cmp))]
-
-pub mod buffer;
 pub mod chunker;
 pub mod converter;
 mod decoder;
 pub mod error;
-#[cfg(any(test, feature = "fixtures"))]
-pub mod fixtures;
 pub mod format;
-mod monitoring;
 pub mod pipeline;
 pub mod preprocessing;
 pub mod time;
-pub mod types;
 pub mod vad;
 
-pub use buffer::{AudioBuffer, AudioBufferMetadata};
 pub use chunker::{ChunkBoundary, Chunker, ChunkerConfig, ProcessedChunk};
+pub use converter::{AudioFormatConverter, StandardAudio};
 pub use error::{Error, Result};
-pub use monitoring::VADStats;
-pub use pipeline::{AudioPipelineCoordinator, ProcessingResult, StageLatencies};
+pub use pipeline::{Pipeline, ProcessingResult, StageLatencies};
 pub use preprocessing::{
     DcHighPassFilter, HighpassOrder, NoiseReducer, NoiseReductionConfig, PreprocessingConfig,
     VadContext,
 };
 pub use time::{AudioDuration, AudioTimestamp};
-pub use types::AudioChunk;
-pub use vad::{NoopVadMetricsCollector, SpeechChunk, VadConfig, VadDetector, VadMetricsCollector};
+pub use vad::{SpeechChunk, VadConfig, VadDetector, VadMetricsCollector, VadStats};
+
+/// Compiles the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

@@ -1,802 +1,685 @@
-//! End-to-end audio processing coordinator.
-//!
-//! Integrates format conversion, VAD, chunking, and preprocessing into a
-//! synchronous pipeline for one input stream at a time.
-//!
-//! # Architecture
-//!
-//! The coordinator follows a simple synchronous design optimized for CPU-bound
-//! audio processing:
+//! End-to-end processing: decode, detect speech, chunk, clean up.
 //!
 //! ```text
-//! Raw Audio Bytes
-//!     ↓
-//! Format Conversion → StandardAudio (16kHz mono PCM)
-//!     ↓
-//! VAD Detection → Speech Segments
-//!     ↓
-//! Chunking → ProcessedChunks (500ms aligned)
-//!     ↓
-//! Preprocessing → Clean Audio
-//!     ↓
-//! Processed Output
+//!  bytes ─► AudioFormatConverter ─┐
+//!                                 ▼
+//!  16 kHz mono samples ─────► VadDetector ─► Chunker ─► DcHighPassFilter ─► NoiseReducer ─► chunks
 //! ```
 //!
-//! # Performance Contract
+//! [`Pipeline`] is stateful. Feed one stream through
+//! [`process_bytes`](Pipeline::process_bytes) or
+//! [`process_samples`](Pipeline::process_samples) in order, then call
+//! [`flush`](Pipeline::flush) to emit whatever is still buffered.
 //!
-//! - **Audio processing latency**: <60ms P95 (all 4 stages)
-//! - **Per-stage tracking**: Individual latency metrics exported
-//! - **Stage reporting**: Per-stage latency metrics are returned
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use speech_prep::pipeline::AudioPipelineCoordinator;
-//!
-//! # fn main() -> speech_prep::error::Result<()> {
-//! let coordinator = AudioPipelineCoordinator::new_with_defaults()?;
-//!
-//! let audio_bytes = std::fs::read("sample.wav")?;
-//! let result = coordinator.process_frame(&audio_bytes)?;
-//!
-//! assert!(result.total_latency < std::time::Duration::from_secs(1));
-//! assert!(result.chunks_processed <= 16);
-//! # Ok(())
-//! # }
-//! ```
+//! Audio inside a speech segment that has not ended yet is held back until
+//! the speaker pauses, so chunk edges fall on speech boundaries. To bound
+//! latency, a segment held longer than
+//! [`with_max_speech_hold`](Pipeline::with_max_speech_hold) (2 s by default)
+//! is emitted in whole chunks marked
+//! [`Continuation`](crate::ChunkBoundary::Continuation) at the cut.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-
-use crate::chunker::{Chunker, ProcessedChunk};
-use crate::converter::{AudioFormatConverter, ConversionMetadata, StandardAudio};
+use crate::chunker::{ChunkBoundary, Chunker, ProcessedChunk, apply_overlaps};
+use crate::converter::{AudioFormatConverter, STANDARD_SAMPLE_RATE};
 use crate::error::{Error, Result};
-use crate::format::AudioFormat;
-use crate::preprocessing::{DcHighPassFilter, NoiseReducer, PreprocessingConfig, VadContext};
-use crate::time::{validate_in_range, AudioDuration, AudioInstant, AudioTimestamp};
-use crate::vad::{SpeechChunk, VadDetector};
+use crate::preprocessing::{
+    DcHighPassFilter, NoiseReducer, NoiseReductionConfig, PreprocessingConfig, VadContext,
+};
+use crate::time::{AudioInstant, AudioTimestamp};
+use crate::vad::{SpeechChunk, VadConfig, VadDetector};
 
-/// Result of processing audio through the complete pipeline.
-#[derive(Debug, Clone, Copy)]
+/// Output of one [`Pipeline`] call.
+#[derive(Debug, Clone, Default)]
 pub struct ProcessingResult {
-    /// Total number of chunks generated.
-    pub chunks_processed: usize,
-
-    /// Total latency for complete pipeline execution.
-    pub total_latency: Duration,
-
-    /// Per-stage latency breakdown.
-    pub stage_latencies: StageLatencies,
-
-    /// Reserved compatibility flag from the earlier fan-out pipeline surface.
-    ///
-    /// The standalone coordinator never applies backpressure, so this is
-    /// always `false`.
-    pub backpressure_active: bool,
+    /// Cleaned chunks, in stream order. May be empty if all new audio is
+    /// still part of an open speech segment.
+    pub chunks: Vec<ProcessedChunk>,
+    /// Wall-clock time per stage for this call.
+    pub latencies: StageLatencies,
 }
 
-/// Latency measurements for each pipeline stage.
+/// Wall-clock time spent in each stage of one call.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageLatencies {
-    /// Format conversion latency.
-    pub format_conversion: Duration,
-
-    /// VAD detection latency.
-    pub vad_detection: Duration,
-
-    /// Chunking latency.
+    /// Decoding, mixing, and resampling. Zero for `process_samples`.
+    pub decode: Duration,
+    /// Voice activity detection.
+    pub vad: Duration,
+    /// Chunking.
     pub chunking: Duration,
-
-    /// Preprocessing latency (per chunk average).
-    pub preprocessing_avg: Duration,
-
-    /// Reserved compatibility field from the earlier fan-out pipeline surface.
-    ///
-    /// The standalone coordinator has no broadcast stage, so this is always
-    /// `Duration::ZERO`.
-    pub broadcasting_avg: Duration,
+    /// DC removal, high-pass, and noise reduction for all chunks.
+    pub preprocessing: Duration,
+    /// The whole call.
+    pub total: Duration,
 }
 
-/// Audio pipeline coordinator.
+/// Stateful decode → VAD → chunk → clean-up pipeline for one stream.
 ///
-/// Orchestrates format conversion, VAD detection, chunking, and preprocessing
-/// in a synchronous pipeline optimized for CPU-bound audio processing.
+/// ```
+/// use speech_prep::Pipeline;
 ///
-/// **Thread Safety**: Preprocessing filters wrapped in `Mutex` for interior
-/// mutability, allowing concurrent frame processing from multiple callers.
+/// # fn main() -> speech_prep::Result<()> {
+/// let mut pipeline = Pipeline::new()?;
+///
+/// // 16 kHz mono samples, e.g. from a microphone, in any block size.
+/// let mut audio = vec![0.0f32; 32_000];
+/// for (i, s) in audio[8_000..24_000].iter_mut().enumerate() {
+///     *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin();
+/// }
+///
+/// let mut chunks = Vec::new();
+/// for block in audio.chunks(1_600) {
+///     chunks.extend(pipeline.process_samples(block)?.chunks);
+/// }
+/// chunks.extend(pipeline.flush()?.chunks);
+///
+/// assert!(chunks.iter().any(|c| c.is_speech()));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
-pub struct AudioPipelineCoordinator {
-    vad_detector: Arc<VadDetector>,
+pub struct Pipeline {
+    vad: VadDetector,
     chunker: Chunker,
-    dc_filter: Mutex<DcHighPassFilter>,
-    noise_reducer: Mutex<NoiseReducer>,
-    stream_buffer: Mutex<StreamBuffer>,
-    processed_cursor: AtomicUsize,
+    dc_filter: DcHighPassFilter,
+    noise_reducer: NoiseReducer,
+    /// Samples not yet emitted as chunks.
+    pending: Vec<f32>,
+    /// Stream index of `pending[0]`.
+    pending_start: usize,
+    /// Tail of the last emitted chunk, used as `overlap_prev` for the next
+    /// call's first chunk.
+    last_tail: Option<Vec<f32>>,
+    /// Longest stretch of an open speech segment held back, in samples.
+    max_hold: usize,
+    /// Part of the currently open segment has already been emitted.
+    continuing_speech: bool,
 }
 
-#[derive(Debug, Default)]
-struct StreamBuffer {
-    base_sample_index: usize,
-    samples: Vec<f32>,
-}
+/// Default for [`Pipeline::with_max_speech_hold`].
+const DEFAULT_MAX_SPEECH_HOLD: Duration = Duration::from_secs(2);
 
-impl StreamBuffer {
-    fn append(&mut self, new_samples: &[f32]) {
-        self.samples.extend_from_slice(new_samples);
-    }
-
-    fn as_slice(&self) -> &[f32] {
-        &self.samples
-    }
-
-    fn base_sample_index(&self) -> usize {
-        self.base_sample_index
-    }
-
-    fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    fn start_time(&self, stream_start: AudioTimestamp, sample_rate: u32) -> Result<AudioTimestamp> {
-        let offset = samples_to_duration(self.base_sample_index, sample_rate)?;
-        Ok(stream_start.add_duration(offset))
-    }
-
-    fn drop_through(&mut self, sample_index: usize) {
-        if sample_index <= self.base_sample_index {
-            return;
-        }
-
-        let drop_count = sample_index
-            .saturating_sub(self.base_sample_index)
-            .min(self.samples.len());
-
-        if drop_count == 0 {
-            return;
-        }
-
-        if drop_count >= self.samples.len() {
-            self.samples.clear();
-            self.base_sample_index = sample_index;
-        } else {
-            self.samples.drain(..drop_count);
-            self.base_sample_index += drop_count;
-        }
-    }
-}
-
-impl AudioPipelineCoordinator {
-    /// Create a new coordinator with provided components.
+impl Pipeline {
+    /// Create a pipeline with default settings for 16 kHz speech.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `vad_detector` - Voice activity detector
-    /// * `chunker` - Audio chunker
-    /// * `dc_filter` - DC offset removal and high-pass filter
-    /// * `noise_reducer` - Spectral noise reduction
-    pub fn new(
-        vad_detector: Arc<VadDetector>,
+    /// Only fails if a default configuration is invalid, which would be a bug.
+    pub fn new() -> Result<Self> {
+        Self::with_components(
+            VadDetector::new(VadConfig::default())?,
+            Chunker::default(),
+            DcHighPassFilter::new(PreprocessingConfig::default())?,
+            NoiseReducer::new(NoiseReductionConfig::default())?,
+        )
+    }
+
+    /// Create a pipeline from configured components.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if any component is not configured
+    /// for 16 kHz input, which is what the pipeline produces.
+    pub fn with_components(
+        vad: VadDetector,
         chunker: Chunker,
         dc_filter: DcHighPassFilter,
         noise_reducer: NoiseReducer,
-    ) -> Self {
-        Self {
-            vad_detector,
-            chunker,
-            dc_filter: Mutex::new(dc_filter),
-            noise_reducer: Mutex::new(noise_reducer),
-            stream_buffer: Mutex::new(StreamBuffer::default()),
-            processed_cursor: AtomicUsize::new(0),
+    ) -> Result<Self> {
+        let rates = [
+            ("VadConfig::sample_rate", vad.config().sample_rate),
+            (
+                "PreprocessingConfig::sample_rate_hz",
+                dc_filter.config().sample_rate_hz,
+            ),
+            (
+                "NoiseReductionConfig::sample_rate_hz",
+                noise_reducer.config().sample_rate_hz,
+            ),
+        ];
+        for (name, rate) in rates {
+            if rate != STANDARD_SAMPLE_RATE {
+                return Err(Error::Configuration(format!(
+                    "{name} is {rate} Hz; the pipeline runs at {STANDARD_SAMPLE_RATE} Hz"
+                )));
+            }
         }
+
+        let mut pipeline = Self {
+            vad,
+            chunker,
+            dc_filter,
+            noise_reducer,
+            pending: Vec::new(),
+            pending_start: 0,
+            last_tail: None,
+            max_hold: 0,
+            continuing_speech: false,
+        }
+        .with_max_speech_hold(DEFAULT_MAX_SPEECH_HOLD);
+        // Components may have been used before; the pipeline counts samples
+        // from zero.
+        pipeline.reset();
+        Ok(pipeline)
     }
 
-    /// Create coordinator with default configuration.
+    /// Limit how long audio inside a speech segment that has not ended yet
+    /// is held back. Default: 2 s.
     ///
-    /// Suitable for testing and standard audio processing scenarios.
+    /// Once more than `hold` is buffered, complete chunks from the open
+    /// segment are emitted right away; the chunk at the cut gets a
+    /// [`ChunkBoundary::Continuation`] edge instead of waiting for the
+    /// speaker to pause. Values shorter than the chunker's `max_duration`
+    /// are raised to it.
+    #[must_use]
+    pub fn with_max_speech_hold(mut self, hold: Duration) -> Self {
+        let hold = hold.max(self.chunker.config().max_duration);
+        self.max_hold = Chunker::duration_to_samples(hold, STANDARD_SAMPLE_RATE);
+        self
+    }
+
+    /// Decode an encoded audio file or fragment and process it.
     ///
     /// # Errors
     ///
-    /// Returns error if component initialization fails.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use speech_prep::pipeline::AudioPipelineCoordinator;
-    ///
-    /// # fn main() -> speech_prep::error::Result<()> {
-    /// let coordinator = AudioPipelineCoordinator::new_with_defaults()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new_with_defaults() -> Result<Self> {
-        use crate::{NoopVadMetricsCollector, VadConfig, VadMetricsCollector};
+    /// Returns decoding errors from
+    /// [`AudioFormatConverter::convert_to_standard`], or a processing error.
+    pub fn process_bytes(&mut self, audio_bytes: &[u8]) -> Result<ProcessingResult> {
+        let start = AudioInstant::now();
+        let audio = AudioFormatConverter::convert_to_standard(audio_bytes)?;
+        let decode = start.elapsed();
 
-        let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
-
-        let vad_config = VadConfig::default();
-        let vad_detector = Arc::new(VadDetector::new(vad_config, metrics)?);
-
-        let chunker = Chunker::default();
-
-        let dc_config = PreprocessingConfig::default();
-        let dc_filter = DcHighPassFilter::new(dc_config)?;
-
-        let noise_config = crate::preprocessing::NoiseReductionConfig::default();
-        let noise_reducer = crate::preprocessing::NoiseReducer::new(noise_config)?;
-
-        Ok(Self::new(vad_detector, chunker, dc_filter, noise_reducer))
+        let mut result = self.process_samples(&audio.samples)?;
+        result.latencies.decode = decode;
+        result.latencies.total += decode;
+        Ok(result)
     }
 
-    /// Process raw audio bytes through complete pipeline.
-    ///
-    /// # Performance Contract
-    ///
-    /// Total audio processing latency must be <60ms P95 for standard inputs
-    /// (500ms audio chunks at 16kHz).
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_bytes` - Raw audio data (WAV, PCM, or other supported formats)
-    ///
-    /// # Returns
-    ///
-    /// Processing result with latency metrics and chunk count.
+    /// Process the next block of 16 kHz mono samples.
     ///
     /// # Errors
     ///
-    /// Returns error if:
-    /// - Format detection/conversion fails
-    /// - VAD detection fails
-    /// - Chunking fails
-    /// - Preprocessing fails
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use speech_prep::pipeline::AudioPipelineCoordinator;
-    /// # fn main() -> speech_prep::error::Result<()> {
-    /// let coordinator = AudioPipelineCoordinator::new_with_defaults()?;
-    /// let audio = std::fs::read("test.wav")?;
-    ///
-    /// let result = coordinator.process_frame(&audio)?;
-    /// assert!(result.total_latency < std::time::Duration::from_millis(60));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn process_frame(&self, audio_bytes: &[u8]) -> Result<ProcessingResult> {
-        let pipeline_start = AudioInstant::now();
+    /// Returns [`Error::InvalidInput`] if a sample is NaN or infinite, or a
+    /// processing error from one of the stages.
+    pub fn process_samples(&mut self, samples: &[f32]) -> Result<ProcessingResult> {
+        if samples.iter().any(|s| !s.is_finite()) {
+            return Err(Error::InvalidInput("samples must be finite".into()));
+        }
+
+        let start = AudioInstant::now();
         let mut latencies = StageLatencies::default();
 
-        let format_start = AudioInstant::now();
-        let standard_audio = AudioFormatConverter::convert_to_standard(audio_bytes)?;
-        latencies.format_conversion = format_start.elapsed();
-
-        self.process_standard_audio(&standard_audio, pipeline_start, latencies)
-    }
-
-    /// Flush pending audio by injecting trailing silence to finalize speech
-    /// segments.
-    ///
-    /// This should be invoked when a streaming session ends to ensure any
-    /// active speech region is emitted before scoring.
-    pub fn flush(&self) -> Result<ProcessingResult> {
-        let pipeline_start = AudioInstant::now();
-        let latencies = StageLatencies::default();
-
-        let config = *self.vad_detector.config();
-        let frame_len = config.frame_length_samples()?;
-        let frames_to_flush = (config.hangover_frames.max(1)) + 1;
-        let silence_samples = vec![0.0f32; frame_len * frames_to_flush];
-
-        let metadata = ConversionMetadata {
-            original_format: AudioFormat::WavPcm,
-            original_sample_rate: config.sample_rate,
-            original_channels: 1,
-            original_bit_depth: Some(16),
-            peak_before: 0.0,
-            peak_after: 0.0,
-            conversion_time_ms: 0.0,
-            detection_time_ms: 0.0,
-            decode_time_ms: 0.0,
-            resample_time_ms: 0.0,
-            mix_time_ms: 0.0,
-        };
-
-        let standard_audio = StandardAudio {
-            samples: silence_samples,
-            metadata,
-        };
-        self.process_standard_audio(&standard_audio, pipeline_start, latencies)
-    }
-
-    fn process_standard_audio(
-        &self,
-        standard_audio: &StandardAudio,
-        pipeline_start: AudioInstant,
-        mut latencies: StageLatencies,
-    ) -> Result<ProcessingResult> {
         let vad_start = AudioInstant::now();
-        let vad_segments = self.vad_detector.detect(&standard_audio.samples)?;
-        latencies.vad_detection = vad_start.elapsed();
+        let segments = self.vad.detect(samples)?;
+        latencies.vad = vad_start.elapsed();
 
-        let sample_rate = self.vad_detector.config().sample_rate;
-        let stream_start_time = self.vad_detector.config().stream_start_time;
+        self.pending.extend_from_slice(samples);
+        let pending_end = self.pending_start + self.pending.len();
 
-        let (chunks, chunk_duration) = {
-            let mut buffer = self.stream_buffer.lock();
-            buffer.append(&standard_audio.samples);
+        // Emit only audio the VAD has finished classifying: everything before
+        // the open segment (or before the next unanalyzed frame), plus the
+        // full extent of any segment that just closed.
+        let closed_end = segments
+            .iter()
+            .map(|seg| self.sample_index(seg.end_time))
+            .max()
+            .unwrap_or(0);
+        let emit_end = self
+            .vad
+            .undecided_from()
+            .max(closed_end)
+            .clamp(self.pending_start, pending_end);
 
-            if buffer.as_slice().is_empty() {
-                Ok::<(Vec<ProcessedChunk>, Duration), Error>((Vec::new(), Duration::default()))
-            } else {
-                let buffer_base = buffer.base_sample_index();
-                let buffer_len = buffer.len();
-                let buffer_end_abs = buffer_base + buffer_len;
-                let processed_before = self.processed_cursor.load(Ordering::Acquire);
-                let slice_start_abs = processed_before.max(buffer_base);
-
-                if slice_start_abs >= buffer_base + buffer_len {
-                    let lookback_samples = (sample_rate as usize) / 5;
-                    let drop_target = slice_start_abs.saturating_sub(lookback_samples);
-                    buffer.drop_through(drop_target);
-                    drop(buffer);
-                    return Ok(ProcessingResult {
-                        chunks_processed: 0,
-                        total_latency: pipeline_start.elapsed(),
-                        stage_latencies: latencies,
-                        backpressure_active: false,
-                    });
-                }
-
-                let base_time = buffer.start_time(stream_start_time, sample_rate)?;
-                let offset_samples = slice_start_abs.saturating_sub(buffer_base);
-                let offset_duration = samples_to_duration(offset_samples, sample_rate)?;
-                let audio_start = base_time.add_duration(offset_duration);
-
-                let audio_slice = buffer
-                    .as_slice()
-                    .get(offset_samples..)
-                    .ok_or_else(|| Error::InvalidInput("invalid buffer window".into()))?;
-
-                let normalized_segments = normalize_vad_segments(
-                    &vad_segments,
-                    stream_start_time,
-                    audio_start,
-                    slice_start_abs,
-                    buffer_end_abs,
-                    sample_rate,
-                )?;
-
-                let chunk_start = AudioInstant::now();
-                let chunks = self.chunker.chunk_with_stream_start(
-                    audio_slice,
-                    sample_rate,
-                    &normalized_segments,
-                    audio_start,
-                )?;
-                let elapsed = chunk_start.elapsed();
-
-                let mut max_processed_sample = processed_before;
-                for chunk in &chunks {
-                    let end_sample =
-                        time_to_sample_index(chunk.end_time, stream_start_time, sample_rate)?;
-                    if end_sample > max_processed_sample {
-                        max_processed_sample = end_sample;
-                    }
-                }
-                self.processed_cursor
-                    .store(max_processed_sample, Ordering::Release);
-
-                let lookback_samples = (sample_rate as usize) / 5; // Retain ~200ms history
-                let drop_target = max_processed_sample.saturating_sub(lookback_samples);
-                buffer.drop_through(drop_target);
-                drop(buffer);
-
-                Ok::<(Vec<ProcessedChunk>, Duration), Error>((chunks, elapsed))
-            }
-        }?;
-        latencies.chunking = chunk_duration;
-
-        let mut total_preprocess = Duration::default();
-        let mut prev_overlap_next: Option<Vec<f32>> = None;
-
-        for chunk in &chunks {
-            let preprocess_start = AudioInstant::now();
-            let mut preprocessed = self.preprocess_chunk(chunk)?;
-
-            if let Some(prev_overlap) = prev_overlap_next.take() {
-                preprocessed.overlap_prev = Some(prev_overlap);
-            } else {
-                preprocessed.overlap_prev = None;
-            }
-
-            prev_overlap_next.clone_from(&preprocessed.overlap_next);
-
-            total_preprocess += preprocess_start.elapsed();
-        }
-
-        let chunk_count = chunks.len().max(1);
-        latencies.preprocessing_avg = total_preprocess / chunk_count as u32;
-        latencies.broadcasting_avg = Duration::ZERO;
-
-        let total_latency = pipeline_start.elapsed();
-
-        if total_latency > Duration::from_millis(60) {
-            tracing::warn!(
-                latency_ms = total_latency.as_millis(),
-                "Audio processing exceeded 60ms target"
-            );
-        }
-
-        let backpressure_active = false;
-
-        Ok(ProcessingResult {
-            chunks_processed: chunks.len(),
-            total_latency,
-            stage_latencies: latencies,
-            backpressure_active,
-        })
+        // Without new speech, wait for a chunk's worth of silence instead of
+        // emitting a tiny chunk on every call.
+        let min_silence = Chunker::duration_to_samples(
+            self.chunker.config().target_duration,
+            STANDARD_SAMPLE_RATE,
+        );
+        let mut chunks = if segments.is_empty() && emit_end - self.pending_start < min_silence {
+            Vec::new()
+        } else {
+            self.emit(&segments, emit_end, &mut latencies)?
+        };
+        chunks.extend(self.emit_held_speech(&mut latencies)?);
+        latencies.total = start.elapsed();
+        Ok(ProcessingResult { chunks, latencies })
     }
 
-    fn preprocess_chunk(&self, chunk: &ProcessedChunk) -> Result<ProcessedChunk> {
-        let vad_ctx = VadContext {
-            is_silence: chunk.is_silence(),
-        };
-        let dc_clean = {
-            let mut filter = self.dc_filter.lock();
-            filter.process(&chunk.samples, Some(&vad_ctx))?
+    /// Close any open speech segment, emit all buffered audio, and reset the
+    /// pipeline so it can start a new stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a processing error from one of the stages.
+    pub fn flush(&mut self) -> Result<ProcessingResult> {
+        let start = AudioInstant::now();
+        let mut latencies = StageLatencies::default();
+
+        let vad_start = AudioInstant::now();
+        let segments = self.vad.flush()?;
+        latencies.vad = vad_start.elapsed();
+
+        let emit_end = self.pending_start + self.pending.len();
+        let chunks = self.emit(&segments, emit_end, &mut latencies)?;
+
+        self.reset();
+        latencies.total = start.elapsed();
+        Ok(ProcessingResult { chunks, latencies })
+    }
+
+    /// Drop all buffered audio and filter state.
+    pub fn reset(&mut self) {
+        let stream_start = self.vad.config().stream_start_time;
+        self.vad.reset(stream_start);
+        self.dc_filter.reset();
+        self.noise_reducer.reset();
+        self.pending.clear();
+        self.pending_start = 0;
+        self.last_tail = None;
+        self.continuing_speech = false;
+    }
+
+    /// Emit whole chunks from an open speech segment that has been held
+    /// longer than `max_hold`.
+    fn emit_held_speech(&mut self, latencies: &mut StageLatencies) -> Result<Vec<ProcessedChunk>> {
+        let analyzed = self.vad.analyzed_until();
+        if analyzed.saturating_sub(self.pending_start) <= self.max_hold {
+            return Ok(Vec::new());
+        }
+        let Some(seg_start) = self.vad.active_segment_start_sample() else {
+            return Ok(Vec::new());
         };
 
-        let denoised = {
-            let mut reducer = self.noise_reducer.lock();
-            reducer.reduce(&dc_clean, Some(vad_ctx))?
+        let target = Chunker::duration_to_samples(
+            self.chunker.config().target_duration,
+            STANDARD_SAMPLE_RATE,
+        )
+        .max(1);
+        let speech_from = seg_start.max(self.pending_start);
+        let cut = speech_from + analyzed.saturating_sub(speech_from) / target * target;
+        if cut <= speech_from {
+            return Ok(Vec::new());
+        }
+        let Some(open) = self.vad.open_segment(cut) else {
+            return Ok(Vec::new());
         };
 
-        let (energy, has_clipping) = Self::compute_energy_and_clipping(&denoised);
-        let snr_db = Self::recalculate_snr(chunk.snr_db, chunk.energy, energy);
+        let mut chunks = self.emit(&[open], cut, latencies)?;
+        if let Some(last) = chunks.last_mut() {
+            last.end_boundary = ChunkBoundary::Continuation;
+        }
+        self.continuing_speech = true;
+        Ok(chunks)
+    }
 
-        let overlap_next = chunk.overlap_next.as_ref().and_then(|existing| {
-            let retain = existing.len().min(denoised.len());
-            denoised.get(denoised.len() - retain..).map(<[f32]>::to_vec)
+    /// Chunk and clean `pending` up to stream sample `emit_end`.
+    fn emit(
+        &mut self,
+        segments: &[SpeechChunk],
+        emit_end: usize,
+        latencies: &mut StageLatencies,
+    ) -> Result<Vec<ProcessedChunk>> {
+        let count = emit_end.saturating_sub(self.pending_start);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let audio = self
+            .pending
+            .get(..count)
+            .ok_or_else(|| Error::Processing("emit range exceeds buffered audio".into()))?;
+
+        let window_start = self.sample_time(self.pending_start);
+        let window_end = self.sample_time(emit_end);
+        let segments: Vec<SpeechChunk> = segments
+            .iter()
+            .filter_map(|seg| {
+                let start = seg.start_time.max(window_start);
+                let end = seg.end_time.min(window_end);
+                (end > start).then_some(SpeechChunk {
+                    start_time: start,
+                    end_time: end,
+                    ..*seg
+                })
+            })
+            .collect();
+
+        let chunk_start = AudioInstant::now();
+        let mut chunks = self.chunker.chunk_with_stream_start(
+            audio,
+            STANDARD_SAMPLE_RATE,
+            &segments,
+            window_start,
+        )?;
+        latencies.chunking = chunk_start.elapsed();
+
+        // The start of this window continues a segment cut by a previous
+        // forced emission.
+        if std::mem::take(&mut self.continuing_speech) {
+            if let Some(first) = chunks.first_mut().filter(|c| !c.is_silence()) {
+                first.start_boundary = ChunkBoundary::Continuation;
+            }
+        }
+
+        let preprocess_start = AudioInstant::now();
+        for chunk in &mut chunks {
+            let ctx = Some(VadContext {
+                is_silence: chunk.is_silence(),
+            });
+            let filtered = self.dc_filter.process(&chunk.samples, ctx)?;
+            chunk.samples = self.noise_reducer.reduce(&filtered, ctx)?;
+
+            let (energy, has_clipping) = Chunker::compute_energy_and_clipping(&chunk.samples);
+            chunk.energy = energy;
+            chunk.has_clipping = has_clipping;
+        }
+
+        let overlap = Chunker::duration_to_samples(
+            self.chunker.config().overlap_duration,
+            STANDARD_SAMPLE_RATE,
+        );
+        apply_overlaps(&mut chunks, overlap, STANDARD_SAMPLE_RATE);
+        if let Some(first) = chunks.first_mut() {
+            first.overlap_prev = self.last_tail.take();
+            if first.overlap_next.is_none() {
+                let len = first.overlap_prev.as_ref().map_or(0, Vec::len);
+                first.overlap_ms = (len as u64 * 1000 / u64::from(STANDARD_SAMPLE_RATE)) as u32;
+            }
+        }
+        self.last_tail = chunks.last().map(|last| {
+            let from = last.samples.len().saturating_sub(overlap);
+            last.samples.get(from..).unwrap_or_default().to_vec()
         });
+        latencies.preprocessing = preprocess_start.elapsed();
 
-        let mut processed = chunk.clone();
-        processed.samples = denoised;
-        processed.energy = energy;
-        processed.snr_db = snr_db;
-        processed.has_clipping = has_clipping;
-        processed.overlap_next = overlap_next;
-        processed.overlap_prev = None;
-
-        Ok(processed)
+        self.pending.drain(..count);
+        self.pending_start = emit_end;
+        Ok(chunks)
     }
 
-    fn compute_energy_and_clipping(samples: &[f32]) -> (f32, bool) {
-        const CLIPPING_THRESHOLD: f32 = 0.999;
-
-        if samples.is_empty() {
-            return (0.0, false);
-        }
-
-        let mut sum_squares = 0.0f32;
-        let mut has_clipping = false;
-        for &sample in samples {
-            let abs = sample.abs();
-            if abs >= CLIPPING_THRESHOLD {
-                has_clipping = true;
-            }
-            sum_squares = sample.mul_add(sample, sum_squares);
-        }
-        let mean_square = sum_squares / samples.len() as f32;
-        (mean_square.sqrt(), has_clipping)
+    fn sample_index(&self, time: AudioTimestamp) -> usize {
+        let offset = time
+            .duration_since(self.vad.config().stream_start_time)
+            .unwrap_or_default();
+        (offset.as_nanos() * u128::from(STANDARD_SAMPLE_RATE) / 1_000_000_000) as usize
     }
 
-    fn recalculate_snr(
-        previous_snr: Option<f32>,
-        previous_energy: f32,
-        new_energy: f32,
-    ) -> Option<f32> {
-        const EPSILON: f32 = 1e-10;
-        let snr_db = previous_snr?;
-
-        if previous_energy <= EPSILON {
-            return Some(snr_db);
-        }
-
-        let noise_rms = previous_energy / 10_f32.powf(snr_db / 20.0);
-        if noise_rms <= EPSILON || new_energy <= EPSILON {
-            return Some(snr_db);
-        }
-
-        let ratio = new_energy / noise_rms;
-        if ratio <= EPSILON {
-            return Some(snr_db);
-        }
-
-        Some(20.0 * ratio.log10())
+    fn sample_time(&self, sample: usize) -> AudioTimestamp {
+        let offset = AudioTimestamp::from_samples(sample as u64, STANDARD_SAMPLE_RATE);
+        self.vad
+            .config()
+            .stream_start_time
+            .add_duration(Duration::from_nanos(offset.nanos()))
     }
-}
-
-fn samples_to_duration(samples: usize, sample_rate: u32) -> Result<AudioDuration> {
-    validate_in_range(sample_rate, 1_u32, u32::MAX, "sample_rate")?;
-
-    let sample_rate_u128 = u128::from(sample_rate);
-    let sample_count = samples as u128;
-    let nanos = (sample_count * 1_000_000_000u128 + (sample_rate_u128 / 2)) / sample_rate_u128;
-    Ok(AudioDuration::from_nanos(nanos as u64))
-}
-
-fn time_to_sample_index(
-    time: AudioTimestamp,
-    stream_start: AudioTimestamp,
-    sample_rate: u32,
-) -> Result<usize> {
-    validate_in_range(sample_rate, 1_u32, u32::MAX, "sample_rate")?;
-
-    let duration = time
-        .duration_since(stream_start)
-        .ok_or_else(|| Error::TemporalOperation("time precedes stream start".into()))?;
-    let samples = (duration.as_secs_f64() * f64::from(sample_rate)).round() as usize;
-    Ok(samples)
-}
-
-fn normalize_vad_segments(
-    segments: &[SpeechChunk],
-    stream_start: AudioTimestamp,
-    slice_start_time: AudioTimestamp,
-    slice_start_sample: usize,
-    buffer_end_sample: usize,
-    sample_rate: u32,
-) -> Result<Vec<SpeechChunk>> {
-    validate_in_range(sample_rate, 1_u32, u32::MAX, "sample_rate")?;
-
-    let mut normalized = Vec::with_capacity(segments.len());
-
-    for segment in segments {
-        let start_sample_abs = time_to_sample_index(segment.start_time, stream_start, sample_rate)?;
-        let end_sample_abs = time_to_sample_index(segment.end_time, stream_start, sample_rate)?;
-
-        if end_sample_abs <= slice_start_sample {
-            // Entire segment already processed; skip.
-            continue;
-        }
-
-        let clamped_start_abs = start_sample_abs.max(slice_start_sample);
-        let clamped_end_abs = end_sample_abs.min(buffer_end_sample);
-
-        if clamped_end_abs <= clamped_start_abs {
-            continue;
-        }
-
-        let rel_start_samples = clamped_start_abs - slice_start_sample;
-        let rel_end_samples = clamped_end_abs - slice_start_sample;
-
-        let start_time =
-            slice_start_time.add_duration(samples_to_duration(rel_start_samples, sample_rate)?);
-        let end_time =
-            slice_start_time.add_duration(samples_to_duration(rel_end_samples, sample_rate)?);
-
-        let mut adjusted = *segment;
-        adjusted.start_time = start_time;
-        adjusted.end_time = end_time;
-        normalized.push(adjusted);
-    }
-
-    Ok(normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::AudioFixtures;
 
-    /// Helper to convert f32 samples to WAV bytes for testing
-    /// Creates a minimal 16-bit PCM WAV file
-    fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-        let mut wav_data = Vec::new();
+    const SR: usize = 16_000;
 
-        // WAV header
-        let num_samples = samples.len() as u32;
-        let num_channels = 1u16;
-        let bits_per_sample = 16u16;
-        let byte_rate = sample_rate * u32::from(num_channels) * u32::from(bits_per_sample) / 8;
-        let block_align = num_channels * bits_per_sample / 8;
-        let data_size = num_samples * u32::from(block_align);
-
-        // RIFF header
-        wav_data.extend_from_slice(b"RIFF");
-        wav_data.extend_from_slice(&(36 + data_size).to_le_bytes());
-        wav_data.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav_data.extend_from_slice(b"fmt ");
-        wav_data.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-        wav_data.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-        wav_data.extend_from_slice(&num_channels.to_le_bytes());
-        wav_data.extend_from_slice(&sample_rate.to_le_bytes());
-        wav_data.extend_from_slice(&byte_rate.to_le_bytes());
-        wav_data.extend_from_slice(&block_align.to_le_bytes());
-        wav_data.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav_data.extend_from_slice(b"data");
-        wav_data.extend_from_slice(&data_size.to_le_bytes());
-
-        // Convert f32 samples to i16 PCM
-        for &sample in samples {
-            let i16_sample = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-            wav_data.extend_from_slice(&i16_sample.to_le_bytes());
+    /// `lead` s of silence, `tone` s of 1 kHz, `tail` s of silence.
+    fn burst(lead: f32, tone: f32, tail: f32) -> Vec<f32> {
+        let (lead, tone, tail) = (
+            (lead * SR as f32) as usize,
+            (tone * SR as f32) as usize,
+            (tail * SR as f32) as usize,
+        );
+        let mut audio = vec![0.0f32; lead + tone + tail];
+        for (i, s) in audio[lead..lead + tone].iter_mut().enumerate() {
+            *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
         }
-
-        wav_data
+        audio
     }
 
-    /// Test coordinator creation with default configuration.
-    #[test]
-    fn test_coordinator_creation_with_defaults() {
-        let coordinator = AudioPipelineCoordinator::new_with_defaults();
-        assert!(
-            coordinator.is_ok(),
-            "Failed to create coordinator with defaults"
-        );
-    }
-
-    /// Test basic frame processing with real audio data.
-    #[test]
-    fn test_process_frame_with_real_audio() {
-        let coordinator =
-            AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
-
-        // Load real test audio and convert to WAV bytes
-        let fixtures = AudioFixtures::new();
-        let audio_sample = fixtures
-            .load_sample("french_short")
-            .expect("Failed to load test audio");
-        let test_audio = samples_to_wav_bytes(&audio_sample.audio_data, audio_sample.sample_rate);
-
-        // Process audio through complete pipeline
-        let result = coordinator.process_frame(&test_audio);
-        assert!(
-            result.is_ok(),
-            "Failed to process audio frame: {:?}",
-            result.err()
-        );
-
-        let processing_result = result.unwrap();
-
-        // Verify results
-        assert!(
-            processing_result.chunks_processed > 0,
-            "No chunks were generated from audio"
-        );
-
-        // Verify latency is tracked (not zero)
-        assert!(
-            processing_result.total_latency > Duration::ZERO,
-            "Latency should be tracked"
-        );
-    }
-
-    /// Test that all stage latencies are tracked.
-    #[test]
-    fn test_stage_latencies_tracked() {
-        let coordinator =
-            AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
-
-        let fixtures = AudioFixtures::new();
-        let audio_sample = fixtures
-            .load_sample("french_short")
-            .expect("Failed to load test audio");
-        let test_audio = samples_to_wav_bytes(&audio_sample.audio_data, audio_sample.sample_rate);
-
-        let result = coordinator
-            .process_frame(&test_audio)
-            .expect("Failed to process audio");
-
-        let latencies = result.stage_latencies;
-
-        // Verify all stages have latency measurements
-        assert!(
-            latencies.format_conversion > Duration::ZERO,
-            "Format conversion latency not tracked"
-        );
-        assert!(
-            latencies.vad_detection > Duration::ZERO,
-            "VAD detection latency not tracked"
-        );
-        assert!(
-            latencies.chunking > Duration::ZERO,
-            "Chunking latency not tracked"
-        );
-
-        let _ = latencies.preprocessing_avg;
-        assert_eq!(
-            latencies.broadcasting_avg,
-            Duration::ZERO,
-            "Standalone pipeline should not report broadcast latency"
-        );
-    }
-
-    /// Test <60ms latency performance contract for audio processing.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "Performance — run with --release")]
-    fn test_latency_performance_contract() {
-        let coordinator =
-            AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
-
-        let fixtures = AudioFixtures::new();
-        let audio_sample = fixtures
-            .load_sample("french_short")
-            .expect("Failed to load test audio");
-        let test_audio = samples_to_wav_bytes(&audio_sample.audio_data, audio_sample.sample_rate);
-
-        coordinator
-            .process_frame(&test_audio)
-            .expect("Failed to process warm-up audio");
-
-        let mut latencies = Vec::new();
-        for _ in 0..5 {
-            let result = coordinator
-                .process_frame(&test_audio)
-                .expect("Failed to process audio");
-            latencies.push(result.total_latency);
+    fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            sample_rate: SR as u32,
+            channels: 1,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for &s in samples {
+            writer.write_sample((s * 32_767.0) as i16).unwrap();
         }
-
-        latencies.sort();
-        let p95_index = (latencies.len() as f64 * 0.95).ceil() as usize - 1;
-        let p95_latency = latencies[p95_index];
-
-        assert!(
-            p95_latency < Duration::from_millis(150),
-            "P95 latency exceeds 150ms (CI-tolerant): {:?}",
-            p95_latency
-        );
+        writer.finalize().unwrap();
+        cursor.into_inner()
     }
 
-    /// Test the compatibility flag remains disabled.
-    #[test]
-    fn test_backpressure_detection() {
-        let coordinator =
-            AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
+    fn run_streamed(audio: &[f32], block: usize) -> Vec<ProcessedChunk> {
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = Vec::new();
+        for b in audio.chunks(block) {
+            chunks.extend(pipeline.process_samples(b).unwrap().chunks);
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+        chunks
+    }
 
-        let fixtures = AudioFixtures::new();
-        let audio_sample = fixtures
-            .load_sample("french_short")
-            .expect("Failed to load test audio");
-        let test_audio = samples_to_wav_bytes(&audio_sample.audio_data, audio_sample.sample_rate);
-
-        let result = coordinator
-            .process_frame(&test_audio)
-            .expect("Failed to process audio");
-
-        assert!(
-            !result.backpressure_active,
-            "Standalone coordinator should not report backpressure"
-        );
-
-        for _ in 0..3 {
-            let result = coordinator
-                .process_frame(&test_audio)
-                .expect("Failed to process audio");
+    fn assert_contiguous(chunks: &[ProcessedChunk], total_samples: usize) {
+        let mut expected_start = AudioTimestamp::EPOCH;
+        for chunk in chunks {
+            let gap = chunk.start_time.as_secs() - expected_start.as_secs();
             assert!(
-                !result.backpressure_active,
-                "Standalone coordinator should not report backpressure"
+                gap.abs() < 1e-3,
+                "gap of {gap}s before chunk at {}",
+                chunk.start_time
             );
+            expected_start = chunk.end_time;
+        }
+        let covered: usize = chunks.iter().map(|c| c.samples.len()).sum();
+        assert!(
+            covered.abs_diff(total_samples) <= chunks.len(),
+            "covered {covered} of {total_samples}"
+        );
+    }
+
+    #[test]
+    fn returns_cleaned_chunks_from_bytes() {
+        let audio = burst(0.5, 1.0, 0.5);
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = pipeline.process_bytes(&wav_bytes(&audio)).unwrap().chunks;
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        assert!(chunks.iter().any(ProcessedChunk::is_speech));
+        assert!(chunks.iter().any(ProcessedChunk::is_silence));
+        assert_contiguous(&chunks, audio.len());
+    }
+
+    #[test]
+    fn open_segment_is_held_until_it_closes() {
+        let mut pipeline = Pipeline::new().unwrap();
+        // Ends in the middle of the tone: the speech part must not be emitted
+        // yet, and certainly not as silence.
+        let first = pipeline
+            .process_samples(&burst(0.5, 0.5, 0.0))
+            .unwrap()
+            .chunks;
+        assert!(first.iter().all(ProcessedChunk::is_silence));
+        let emitted: f64 = first
+            .iter()
+            .map(|c| c.duration().unwrap().as_secs_f64())
+            .sum();
+        assert!(
+            emitted <= 0.55,
+            "emitted {emitted}s before the open segment"
+        );
+
+        let rest = pipeline.flush().unwrap().chunks;
+        assert!(rest.iter().any(ProcessedChunk::is_speech));
+    }
+
+    fn speech_samples(chunks: &[ProcessedChunk]) -> usize {
+        chunks
+            .iter()
+            .filter(|c| c.is_speech())
+            .map(|c| c.samples.len())
+            .sum()
+    }
+
+    fn pipeline_with(vad: VadDetector) -> Pipeline {
+        Pipeline::with_components(
+            vad,
+            Chunker::default(),
+            DcHighPassFilter::new(PreprocessingConfig::default()).unwrap(),
+            NoiseReducer::new(NoiseReductionConfig::default()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn block_size_does_not_change_result() {
+        let audio = burst(0.5, 1.0, 0.5);
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(reference > 15_000, "reference {reference}");
+
+        for block in [1, 16, 64, 160, 1_600, 8_000] {
+            let chunks = run_streamed(&audio, block);
+            assert_contiguous(&chunks, audio.len());
+            let speech = speech_samples(&chunks);
+            assert!(
+                speech.abs_diff(reference) <= 320,
+                "block {block}: {speech} speech samples vs {reference}"
+            );
+            // Tiny blocks must not turn into tiny chunks.
+            assert!(chunks.len() <= 8, "block {block}: {} chunks", chunks.len());
         }
     }
 
-    /// Test processing empty audio handles gracefully.
     #[test]
-    fn test_process_empty_audio() {
-        let coordinator =
-            AudioPipelineCoordinator::new_with_defaults().expect("Failed to create coordinator");
+    fn high_frame_overlap_does_not_duplicate_audio() {
+        let tone = |n: usize| burst(0.0, n as f32 / SR as f32, 0.0);
+        for gap in [400, 568, 700] {
+            let mut audio = vec![0.0f32; 4_000];
+            audio.extend(tone(5_000));
+            audio.extend(vec![0.0; gap]);
+            audio.extend(tone(5_000));
+            audio.extend(vec![0.0; 4_000]);
 
-        let empty_audio = &[];
-        let result = coordinator.process_frame(empty_audio);
+            let mut pipeline = pipeline_with(
+                VadDetector::new(VadConfig {
+                    frame_overlap: 0.75,
+                    ..VadConfig::default()
+                })
+                .unwrap(),
+            );
+            let mut chunks = pipeline.process_samples(&audio).unwrap().chunks;
+            chunks.extend(pipeline.flush().unwrap().chunks);
+            assert_contiguous(&chunks, audio.len());
+        }
+    }
 
-        assert!(result.is_err(), "Empty audio should return error");
+    #[test]
+    fn previously_used_detector_is_reset() {
+        let vad = VadDetector::new(VadConfig::default()).unwrap();
+        vad.detect(&vec![0.0; SR]).unwrap();
+        let mut pipeline = pipeline_with(vad);
+
+        let audio = burst(0.5, 1.0, 0.5);
+        let mut chunks = Vec::new();
+        for block in audio.chunks(1_600) {
+            chunks.extend(pipeline.process_samples(block).unwrap().chunks);
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(speech_samples(&chunks).abs_diff(reference) <= 320);
+    }
+
+    #[test]
+    fn long_speech_is_emitted_while_still_open() {
+        let audio = burst(0.5, 6.0, 0.5);
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = Vec::new();
+        let mut max_buffered = 0;
+        let mut emitted_during_speech = false;
+
+        for (i, block) in audio.chunks(1_600).enumerate() {
+            let new = pipeline.process_samples(block).unwrap().chunks;
+            let now = (i + 1) * 1_600;
+            if now < SR * 6 && new.iter().any(ProcessedChunk::is_speech) {
+                emitted_during_speech = true;
+            }
+            chunks.extend(new);
+            max_buffered = max_buffered.max(pipeline.pending.len());
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        assert!(emitted_during_speech);
+        // Default hold of 2 s, plus at most one chunk and one block of slack.
+        assert!(
+            max_buffered <= 2 * SR + SR / 2 + 1_600,
+            "buffered {max_buffered}"
+        );
+        assert_contiguous(&chunks, audio.len());
+
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(speech_samples(&chunks).abs_diff(reference) <= 320);
+
+        let starts = chunks
+            .iter()
+            .filter(|c| c.start_boundary == ChunkBoundary::SpeechStart)
+            .count();
+        assert_eq!(starts, 1, "only the first speech chunk starts the segment");
+    }
+
+    #[test]
+    fn overlap_ms_matches_overlap_vectors() {
+        let audio = burst(0.5, 1.0, 0.5);
+        for block in [1_600, 4_000] {
+            for chunk in run_streamed(&audio, block) {
+                let len = chunk
+                    .overlap_next
+                    .as_ref()
+                    .or(chunk.overlap_prev.as_ref())
+                    .map_or(0, Vec::len);
+                assert_eq!(chunk.overlap_ms as usize, len * 1000 / SR, "{chunk:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn flush_resets_for_next_stream() {
+        let audio = burst(0.5, 1.0, 0.5);
+        let mut pipeline = Pipeline::new().unwrap();
+        pipeline.process_samples(&audio).unwrap();
+        pipeline.flush().unwrap();
+
+        let second = pipeline.process_samples(&audio).unwrap().chunks;
+        assert_eq!(
+            second.first().map(|c| c.start_time),
+            Some(AudioTimestamp::EPOCH)
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_samples() {
+        let mut pipeline = Pipeline::new().unwrap();
+        assert!(pipeline.process_samples(&[0.0, f32::NAN]).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_sample_rate() {
+        let vad = VadDetector::new(VadConfig {
+            sample_rate: 8_000,
+            ..VadConfig::default()
+        })
+        .unwrap();
+        let result = Pipeline::with_components(
+            vad,
+            Chunker::default(),
+            DcHighPassFilter::new(PreprocessingConfig::default()).unwrap(),
+            NoiseReducer::new(NoiseReductionConfig::default()).unwrap(),
+        );
+        assert!(matches!(result, Err(Error::Configuration(_))));
+    }
+
+    #[test]
+    fn empty_bytes_are_rejected() {
+        assert!(Pipeline::new().unwrap().process_bytes(&[]).is_err());
     }
 }

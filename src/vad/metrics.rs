@@ -1,59 +1,62 @@
-//! VAD metrics collection and monitoring.
+//! Optional instrumentation hooks for the VAD.
 
-use crate::monitoring::VADStats;
 use crate::time::AudioDuration;
 
-/// Metrics sink for VAD instrumentation.
+/// Receives a [`VadMetricsSnapshot`] after every
+/// [`VadDetector::detect`](super::VadDetector::detect) call.
+///
+/// Implement this to export VAD behaviour to your own metrics system. Pass
+/// it with [`VadDetector::with_metrics`](super::VadDetector::with_metrics).
 pub trait VadMetricsCollector: Send + Sync {
-    /// Record a snapshot of VAD metrics.
+    /// Record one snapshot.
     fn record_vad_metrics(&self, snapshot: &VadMetricsSnapshot);
 }
 
-/// Structured metrics emitted after each detection call.
-#[derive(Debug, Clone)]
+/// Frame counts from one `detect` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VadStats {
+    /// Analysis frames processed.
+    pub frames_processed: u64,
+    /// Frames classified as speech (including hangover frames).
+    pub speech_frames: u64,
+    /// Frames classified as silence.
+    pub silence_frames: u64,
+}
+
+impl VadStats {
+    /// Fraction of frames classified as speech, or 0.0 if none were processed.
+    #[must_use]
+    pub fn speech_ratio(&self) -> f64 {
+        if self.frames_processed == 0 {
+            return 0.0;
+        }
+        self.speech_frames as f64 / self.frames_processed as f64
+    }
+}
+
+/// Metrics emitted after each detection call.
+#[derive(Debug, Clone, Copy)]
 pub struct VadMetricsSnapshot {
-    /// Frame-level statistics collected during detection.
-    pub stats: VADStats,
-    /// End-to-end latency for the detection call.
+    /// Frame counts for the call.
+    pub stats: VadStats,
+    /// Wall-clock time spent in the call.
     pub latency: AudioDuration,
-    /// Adaptive baseline state captured alongside the stats.
+    /// Adaptive threshold state at the end of the call.
     pub adaptive: AdaptiveThresholdSnapshot,
 }
 
-/// Snapshot of the adaptive baseline and threshold state.
+/// Adaptive baseline and threshold state of the detector.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveThresholdSnapshot {
-    /// Current exponentially weighted baseline for energy.
+    /// Running energy baseline (updated during silence only).
     pub energy_baseline: f32,
-    /// Current exponentially weighted baseline for spectral flux.
+    /// Running spectral-flux baseline (updated during silence only).
     pub flux_baseline: f32,
-    /// Current dynamic decision threshold used by the detector.
+    /// Current decision threshold.
     pub dynamic_threshold: f32,
 }
 
-impl VadMetricsSnapshot {
-    /// Create a new snapshot from aggregated stats and observed latency.
-    #[must_use]
-    pub fn new(
-        stats: VADStats,
-        latency: AudioDuration,
-        adaptive: AdaptiveThresholdSnapshot,
-    ) -> Self {
-        Self {
-            stats,
-            latency,
-            adaptive,
-        }
-    }
-
-    /// Convenience accessor for the speech ratio.
-    #[must_use]
-    pub fn speech_ratio(&self) -> f64 {
-        self.stats.speech_ratio()
-    }
-}
-
-/// No-op metrics collector for components that do not require instrumentation.
+/// Collector that discards every snapshot. Used by [`VadDetector::new`](super::VadDetector::new).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopVadMetricsCollector;
 

@@ -3,18 +3,6 @@
 //! Validates the audio conversion pipeline across different sample rates,
 //! channel configurations, and edge cases using synthetic audio only (no
 //! external WAV file dependencies).
-//!
-//! Test coverage gaps addressed:
-//! - Sample rate conversion: 8kHz, 24kHz, 44.1kHz, 48kHz → 16kHz
-//! - Stereo → mono mixing
-//! - Edge cases: empty buffer, single sample, max duration boundary
-
-// Integration test lint allows
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::panic)]
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::float_cmp)]
 
 use std::f32::consts::PI;
 use std::io::Cursor;
