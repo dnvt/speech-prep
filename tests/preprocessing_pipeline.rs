@@ -1,28 +1,4 @@
-//! Integration tests for complete preprocessing pipeline.
-//!
-//! This module validates the end-to-end integration of all preprocessing
-//! components:
-//! - DC Offset Removal & High-Pass Filtering
-//! - Noise Reduction
-//! - Normalization
-//! - Quality Assessment
-//!
-//! # Performance Target
-//!
-//! - Total latency: <30ms for 1 second of 16 kHz mono audio
-//! - Stage breakdown:
-//!   - DC/High-pass: <5ms
-//!   - Noise reduction: <15ms
-//!   - Normalization: <5ms
-//!   - Quality assessment: <10ms
-
-// Test-specific lint allows: integration tests require unwrap/expect for ergonomic assertions
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::print_stdout)]
-#![allow(clippy::print_stderr)]
-
-use std::time::Instant;
+//! DC/high-pass -> noise reduction -> normalization -> quality, chained.
 
 use speech_prep::error::Result;
 use speech_prep::preprocessing::{
@@ -31,7 +7,7 @@ use speech_prep::preprocessing::{
 };
 
 const SAMPLE_RATE: u32 = 16000;
-const ONE_SECOND_SAMPLES: usize = 16000;
+const ONE_SECOND_SAMPLES: usize = 16_000;
 
 /// Complete preprocessing pipeline result.
 #[derive(Debug)]
@@ -213,116 +189,6 @@ fn test_noise_reduction_integration() {
         "Quality degraded significantly: {:.2} -> {:.2}",
         input_metrics.quality_score,
         result.quality_score
-    );
-}
-
-#[test]
-fn test_performance_contract_total_latency() {
-    // Validate total pipeline latency is <30ms for 1 second of audio
-    let input = vec![0.2f32; ONE_SECOND_SAMPLES];
-
-    let start = Instant::now();
-    let _ = preprocess_audio(&input).expect("Pipeline should execute for performance test");
-    let elapsed = start.elapsed();
-
-    if cfg!(debug_assertions) {
-        println!(
-            "Pipeline latency (debug build): {} ms — informational only",
-            elapsed.as_millis()
-        );
-    } else {
-        assert!(
-            elapsed.as_millis() < 30,
-            "Pipeline latency {} ms exceeds 30 ms target",
-            elapsed.as_millis()
-        );
-    }
-}
-
-#[test]
-fn test_performance_per_stage() {
-    // Measure individual stage latencies
-    let input = vec![0.2f32; ONE_SECOND_SAMPLES];
-
-    // Stage 1: DC offset + high-pass
-    let dc_config = PreprocessingConfig::default();
-    let mut dc_filter = DcHighPassFilter::new(dc_config).expect("Should create DC filter");
-    let start = Instant::now();
-    let filtered = dc_filter
-        .process(&input, None)
-        .expect("Should process DC/high-pass");
-    let dc_elapsed = start.elapsed();
-
-    // Stage 2: Noise reduction
-    let noise_config = NoiseReductionConfig::default();
-    let mut noise_reducer = NoiseReducer::new(noise_config).expect("Should create noise reducer");
-    let vad_ctx = VadContext { is_silence: false };
-    let start = Instant::now();
-    let denoised = noise_reducer
-        .reduce(&filtered, Some(vad_ctx))
-        .expect("Should reduce noise");
-    let noise_elapsed = start.elapsed();
-
-    // Stage 3: Normalization
-    let normalizer = Normalizer::new(0.5, 10.0).expect("Should create normalizer");
-    let start = Instant::now();
-    let normalized_audio = normalizer
-        .normalize(&denoised)
-        .expect("Should normalize audio");
-    let norm_elapsed = start.elapsed();
-
-    // Stage 4: Quality assessment
-    let assessor = QualityAssessor::new(SAMPLE_RATE);
-    let start = Instant::now();
-    let _ = assessor
-        .assess(&normalized_audio)
-        .expect("Should assess quality");
-    let qual_elapsed = start.elapsed();
-
-    // Log stage timings (visible with --nocapture)
-    println!("Stage latencies (1 second of audio @ 16 kHz):");
-    println!(
-        "  DC/High-pass:     {:>4} ms (target: <5 ms)",
-        dc_elapsed.as_millis()
-    );
-    println!(
-        "  Noise reduction:  {:>4} ms (target: <15 ms)",
-        noise_elapsed.as_millis()
-    );
-    println!(
-        "  Normalization:    {:>4} ms (target: <5 ms)",
-        norm_elapsed.as_millis()
-    );
-    println!(
-        "  Quality assess:   {:>4} ms (target: <10 ms)",
-        qual_elapsed.as_millis()
-    );
-
-    if cfg!(debug_assertions) {
-        println!("Per-stage latency checks skipped for debug builds");
-        return;
-    }
-
-    // Validate individual stage contracts (release/profiled builds only)
-    assert!(
-        dc_elapsed.as_millis() < 5,
-        "DC/High-pass {} ms exceeds 5 ms target",
-        dc_elapsed.as_millis()
-    );
-    assert!(
-        noise_elapsed.as_millis() < 15,
-        "Noise reduction {} ms exceeds 15 ms target",
-        noise_elapsed.as_millis()
-    );
-    assert!(
-        norm_elapsed.as_millis() < 5,
-        "Normalization {} ms exceeds 5 ms target",
-        norm_elapsed.as_millis()
-    );
-    assert!(
-        qual_elapsed.as_millis() < 10,
-        "Quality assessment {} ms exceeds 10 ms target",
-        qual_elapsed.as_millis()
     );
 }
 

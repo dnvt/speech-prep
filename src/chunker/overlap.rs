@@ -4,7 +4,6 @@ use crate::chunker::ProcessedChunk;
 ///
 /// Post-processes a vector of chunks to extract overlap regions from
 /// adjacent chunks.
-#[allow(clippy::indexing_slicing)]
 pub fn apply_overlaps(chunks: &mut [ProcessedChunk], overlap_samples: usize, sample_rate: u32) {
     if chunks.is_empty() || overlap_samples == 0 {
         return;

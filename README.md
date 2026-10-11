@@ -1,89 +1,127 @@
 # speech-prep
 
-Speech-focused audio preprocessing for Rust: voice activity detection, WAV
-decoding, resampling, noise reduction, normalization, quality checks, and
-speech-aligned chunking.
+[![crates.io](https://img.shields.io/crates/v/speech-prep.svg)](https://crates.io/crates/speech-prep)
+[![docs.rs](https://docs.rs/speech-prep/badge.svg)](https://docs.rs/speech-prep)
+[![CI](https://github.com/dnvt/speech-prep/actions/workflows/ci.yml/badge.svg)](https://github.com/dnvt/speech-prep/actions/workflows/ci.yml)
 
-This crate is small on purpose. It is for preparing learner or voice audio
-before model inference or scoring. It is not a full speech recognition system.
+Audio preprocessing for speech in pure Rust. It turns a recording or a live
+stream into clean 16 kHz mono chunks that line up with speech, ready to feed
+a speech model or a scoring step.
+
+```text
+file / stream ─► decode ─► 16 kHz mono ─► VAD ─► chunk ─► DC + high-pass ─► denoise ─► chunks
+```
+
+It doesn't do speech recognition, speaker diarization, or source
+separation.
 
 ```bash
 cargo add speech-prep
 ```
 
-## Usage
+## Quick start
 
-```rust
-use std::sync::Arc;
-use speech_prep::{NoopVadMetricsCollector, VadConfig, VadDetector, VadMetricsCollector};
+```rust,no_run
+use speech_prep::Pipeline;
 
-let config = VadConfig::default();
-let metrics: Arc<dyn VadMetricsCollector> = Arc::new(NoopVadMetricsCollector);
-let detector = VadDetector::new(config, metrics)?;
+fn main() -> speech_prep::Result<()> {
+    let bytes = std::fs::read("recording.mp3")?;
 
-let segments = detector.detect(&audio_samples)?;
-for seg in &segments {
-    println!("{:.3}s — {:.3}s", seg.start_time.as_secs(), seg.end_time.as_secs());
+    let mut pipeline = Pipeline::new()?;
+    let mut chunks = pipeline.process_bytes(&bytes)?.chunks;
+    chunks.extend(pipeline.flush()?.chunks);
+
+    for chunk in chunks.iter().filter(|c| c.is_speech()) {
+        println!("{} - {}  {} samples", chunk.start_time, chunk.end_time, chunk.samples.len());
+    }
+    Ok(())
 }
 ```
 
-Run the example:
+For live audio, call `pipeline.process_samples(&block)` with 16 kHz mono
+`f32` blocks of any size, then `flush()` at the end of the stream. Speech is
+held back until the speaker pauses, or for at most 2 s
+(`with_max_speech_hold`), so chunks line up with speech without unbounded
+delay.
+
+Try it on a file:
 
 ```bash
-cargo run --example vad_detect
+cargo run --release --example process_file -- path/to/recording.wav
 ```
 
-Example output:
+## Using the stages directly
 
-```text
-speech-prep: VAD detection example
+Each stage works on its own:
 
-Audio: 2.0s at 16000Hz (32000 samples)
-Speech inserted: 0.3s — 1.5s (1.2s duration)
+```rust,no_run
+use speech_prep::{AudioFormatConverter, Chunker, VadConfig, VadDetector};
 
-Detected 1 speech segment(s):
-  Segment 1: 0.290s — 1.540s  (confidence: 1.00, energy: 0.0362)
+fn main() -> speech_prep::Result<()> {
+    let audio = AudioFormatConverter::convert_file("recording.flac")?; // 16 kHz mono
+    let vad = VadDetector::new(VadConfig::default())?;
+    let mut segments = vad.detect(&audio.samples)?;
+    segments.extend(vad.flush()?); // close a segment that runs to the end
+    let chunks = Chunker::default().chunk(&audio.samples, 16_000, &segments)?;
+    println!("{} speech segments, {} chunks", segments.len(), chunks.len());
+    Ok(())
+}
 ```
 
-## What is included
+| Module | What it does |
+|--------|--------------|
+| `converter` | Decode, downmix, and resample to 16 kHz mono `f32` |
+| `vad` | Voice activity detection from frame energy and spectral flux, with adaptive thresholds |
+| `chunker` | Split audio into ~500 ms chunks aligned to speech, with overlap context |
+| `preprocessing` | DC removal, Butterworth high-pass, spectral-subtraction denoising, RMS normalization, quality metrics |
+| `pipeline` | All of the above, streaming |
 
-- VAD with energy and spectral-flux signals.
-- WAV/PCM decoding to mono 16kHz `f32` samples.
-- Format detection for common containers.
-- DC removal, high-pass filtering, normalization, and stationary noise
-  reduction.
-- Speech-aligned chunking with overlap metadata.
-- Lightweight quality metrics for audio checks.
+## Supported input
 
-## Current limits
+| Codec | Containers | Decoded |
+|-------|------------|:-------:|
+| PCM (integer, float, mu-law, A-law) | WAV, AIFF, CAF | yes |
+| ADPCM (Microsoft, IMA) | WAV | yes |
+| FLAC | FLAC, Ogg | yes |
+| ALAC | MP4/M4A, CAF | yes |
+| MP3 | MP3 | yes |
+| AAC-LC | MP4/M4A | yes |
+| Vorbis | Ogg, WebM | yes |
+| Opus | Ogg, WebM | no: detected, then rejected with `Error::Unsupported` |
 
-- WAV decoding is implemented. Other formats may be detected, but they are not
-  decoded by the high-level converter yet.
-- Resampling uses linear interpolation. It is simple and dependency-light, not
-  studio-grade sample-rate conversion.
-- The VAD example uses synthetic audio. It is a runnable smoke test, not a
-  benchmark.
+Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia). Any
+channel count is averaged to mono, and sample rates from 4 to 768 kHz are
+accepted.
 
-See [`docs/audio-support.md`](docs/audio-support.md) for the current support
-matrix and format-support rules. See [`docs/benchmarks.md`](docs/benchmarks.md)
-for the current benchmark policy.
+## Limitations
 
-## Trust And Scope
+- **Resampling** uses a windowed-sinc low-pass filter. Content between
+  7.2 and 8 kHz is rolled off and everything above 8 kHz is removed, so the
+  16 kHz output keeps the speech band but not the top of the spectrum.
+- **VAD** is signal-based. It is fast and needs no model, but it can trigger
+  on non-speech sounds like music or typing. Tune it with `VadConfig`
+  (`activation_margin`, `min_speech_energy`, `hangover_frames`).
+- **Noise reduction** handles steady noise (fans, hum, hiss). It won't
+  remove other voices, music, or reverb.
+- **The pipeline** runs at 16 kHz, and `process_bytes` decodes its whole
+  input in memory.
 
-- [`SECURITY.md`](SECURITY.md): how to report sensitive issues without exposing
-  private audio.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): contribution rules, test commands, and
-  AI-assistance disclosure expectations.
+## Performance
 
-## Development
+Everything runs on the calling thread with no model inference, so all
+stages are much faster than real time. `cargo bench --bench throughput`
+prints per-stage timings for 10 s of synthetic audio on your machine.
 
-```bash
-cargo test
-cargo test --features fixtures
-cargo clippy -- -D warnings
-cargo fmt --check
-```
+## Minimum Rust version
+
+1.87. The crate uses edition 2024, so Cargo picks dependency versions that
+build on your compiler.
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT OR Apache-2.0
+[MIT](LICENSE)

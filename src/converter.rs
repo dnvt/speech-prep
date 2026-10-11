@@ -1,523 +1,328 @@
-//! High-level audio format conversion pipeline.
+//! Decode audio files to 16 kHz mono `f32` samples.
 //!
-//! This module provides a unified API for detecting common audio formats and
-//! converting WAV/PCM input to the crate's standard format: mono, 16kHz,
-//! normalized f32 samples.
-//!
-//! ## Pipeline Stages
-//!
-//! 1. **Format Detection**: Identify audio container format (WAV, MP3, FLAC,
-//!    etc.)
-//! 2. **Decoding**: Extract PCM samples from WAV input (supports 16/24-bit)
-//! 3. **Resampling**: Convert to 16kHz standard rate (linear interpolation)
-//! 4. **Channel Mixing**: Downmix to mono (simple averaging)
-//!
-//! ## Timing Notes
-//!
-//! Conversion metadata records per-stage timings. Treat any latency number as a
-//! measurement for a specific build, input, and machine, not as a crate-wide
-//! guarantee.
-//!
-//! ## Example
-//!
-//! ```rust,no_run
-//! use speech_prep::converter::AudioFormatConverter;
-//!
-//! let audio_bytes = std::fs::read("recording.wav")?;
-//! let standard = AudioFormatConverter::convert_to_standard(&audio_bytes)?;
-//!
-//! assert!(!standard.samples.is_empty());
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```text
+//! bytes ─► detect format ─► decode (Symphonia) ─► mix to mono ─► resample to 16 kHz
 //! ```
+//!
+//! Supported inputs: PCM (any bit depth, float, mu-law, A-law) and ADPCM in
+//! WAV, AIFF, or CAF; FLAC; ALAC; MP3; AAC-LC in MP4/M4A; Vorbis in Ogg or
+//! WebM. Opus is detected but rejected with [`Error::Unsupported`].
+//!
+//! Any channel count is accepted and averaged to mono. Resampling uses a
+//! windowed-sinc filter that passes up to 7.2 kHz and removes content above
+//! 8 kHz instead of letting it alias.
 
+use std::path::Path;
+use std::time::Duration;
+
+use crate::decoder::{self, ChannelMixer, SampleRateConverter};
 use crate::error::{Error, Result};
-use crate::time::{AudioDuration, AudioInstant};
+use crate::format::AudioFormat;
+use crate::time::AudioInstant;
 
-use crate::decoder::{ChannelMixer, SampleRateConverter, WavDecoder};
-use crate::format::{AudioFormat, FormatDetector};
+/// Input sample rates the converter accepts. Rates outside this range only
+/// occur in corrupt or crafted files, and resampling them would need huge
+/// filters (from far above) or huge outputs (from far below).
+pub const SUPPORTED_INPUT_RATES: std::ops::RangeInclusive<u32> = 4_000..=768_000;
 
-/// Standardized audio output: mono, 16kHz, normalized samples.
-///
-/// This is the canonical format used by the rest of the crate.
+/// Sample rate of [`StandardAudio`].
+pub const STANDARD_SAMPLE_RATE: u32 = SampleRateConverter::TARGET_SAMPLE_RATE;
+
+/// Mono, 16 kHz audio with samples in `[-1.0, 1.0]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StandardAudio {
-    /// Mono audio samples at 16kHz, normalized to [-1.0, 1.0].
+    /// Mono samples at [`STANDARD_SAMPLE_RATE`], always finite and within
+    /// `[-1.0, 1.0]`.
     pub samples: Vec<f32>,
-    /// Metadata tracking the conversion journey and quality metrics.
+    /// What the input looked like before conversion.
     pub metadata: ConversionMetadata,
 }
 
 impl StandardAudio {
-    /// Total number of mono samples.
+    /// Number of samples.
     #[must_use]
     pub fn sample_count(&self) -> usize {
         self.samples.len()
     }
 
-    /// Duration in seconds at 16kHz.
+    /// Duration in seconds.
     #[must_use]
     pub fn duration_sec(&self) -> f64 {
-        self.samples.len() as f64 / 16000.0
+        self.samples.len() as f64 / f64::from(STANDARD_SAMPLE_RATE)
     }
 
-    /// Check if the audio is effectively silent (all samples near zero).
+    /// `true` if every sample is below -80 dBFS.
     #[must_use]
     pub fn is_silent(&self) -> bool {
         self.samples.iter().all(|&s| s.abs() < 1e-4)
     }
 }
 
-/// Metadata tracking the complete conversion pipeline journey.
-///
-/// Captures information from all four conversion stages.
+/// Properties of the source audio and the cost of converting it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConversionMetadata {
-    /// Detected audio format (WAV, MP3, FLAC, etc.).
+    /// Detected input format.
     pub original_format: AudioFormat,
-    /// Original sample rate in Hz before resampling.
+    /// Input sample rate in Hz.
     pub original_sample_rate: u32,
-    /// Original number of channels before mixing.
-    pub original_channels: u8,
-    /// Original bit depth (if applicable, e.g., 16, 24 for PCM).
+    /// Input channel count.
+    pub original_channels: u16,
+    /// Input bits per sample, when the codec reports it.
     pub original_bit_depth: Option<u16>,
-    /// Peak amplitude in original audio before any processing.
+    /// Peak absolute sample value across all input channels.
     pub peak_before: f32,
-    /// Peak amplitude after complete conversion pipeline.
+    /// Peak absolute sample value of the converted output.
     pub peak_after: f32,
-    /// Total time spent in conversion pipeline (all 4 stages).
-    pub conversion_time_ms: f64,
-    /// Time spent in format detection stage.
-    pub detection_time_ms: f64,
-    /// Time spent in decoding stage.
-    pub decode_time_ms: f64,
-    /// Time spent in resampling stage.
-    pub resample_time_ms: f64,
-    /// Time spent in channel mixing stage.
-    pub mix_time_ms: f64,
+    /// Wall-clock time spent converting.
+    pub conversion_time: Duration,
 }
 
 impl ConversionMetadata {
-    /// Check if any stage exceeded a conservative local latency threshold.
+    /// `peak_after / peak_before`, or 1.0 for silent input.
     ///
-    /// This helper flags work that may deserve profiling. Treat it as a
-    /// diagnostic hint, not a benchmark result.
-    #[must_use]
-    pub fn has_performance_issue(&self) -> bool {
-        self.conversion_time_ms > 10.0
-            || self.detection_time_ms > 1.0
-            || self.decode_time_ms > 3.0
-            || self.resample_time_ms > 5.0
-            || self.mix_time_ms > 1.0
-    }
-
-    /// Calculate the peak amplitude reduction ratio from conversion.
-    ///
-    /// Returns the ratio of final peak to original peak. Values:
-    /// - 1.0 = no amplitude change
-    /// - <1.0 = amplitude reduced (common with averaging/resampling)
-    /// - >1.0 = amplitude increased (rare, may indicate issue)
+    /// Downmixing out-of-phase channels lowers the peak, so values well
+    /// below 1.0 can point at a stereo phase problem.
     #[must_use]
     pub fn peak_ratio(&self) -> f32 {
         if self.peak_before.abs() < f32::EPSILON {
-            1.0 // Avoid division by zero for silent input
+            1.0
         } else {
             self.peak_after / self.peak_before
         }
     }
 }
 
-/// High-level audio format converter.
-///
-/// Detects common audio container formats and converts WAV/PCM input to the
-/// standard format: mono, 16kHz, normalized f32 samples.
-///
-/// ## Pipeline Architecture
-///
-/// ```text
-/// Input Bytes
-///     ↓
-/// [Format Detection] ← 6 formats: WAV, MP3, FLAC, Opus, WebM, AAC
-///     ↓
-/// [WAV Decoding] ← 16/24-bit PCM normalization
-///     ↓
-/// [Resampling] ← Arbitrary rate → 16kHz (linear interpolation)
-///     ↓
-/// [Channel Mixing] ← Multi-channel → Mono (simple averaging)
-///     ↓
-/// StandardAudio (mono, 16kHz, f32)
-/// ```
-///
-/// ## Current Scope Limitations
-///
-/// - **Formats**: Only WAV decoding implemented; other formats detected but not
-///   decoded
-/// - **Channel Counts**: 1, 2, 4, 6 channels supported
-/// - **Bit Depths**: 16-bit and 24-bit PCM only
-/// - **Resampling**: Linear interpolation (sinc reserved for future)
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use speech_prep::converter::AudioFormatConverter;
-///
-/// let wav_bytes = std::fs::read("audio.wav")?;
-/// let standard = AudioFormatConverter::convert_to_standard(&wav_bytes)?;
-///
-/// assert!(standard.metadata.original_sample_rate > 0);
-/// assert!(standard.metadata.original_channels > 0);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
+/// Converts encoded audio to [`StandardAudio`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AudioFormatConverter;
 
 impl AudioFormatConverter {
-    /// Create a new audio format converter instance.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// Convert WAV audio bytes to standard format: mono, 16kHz, f32.
+    /// Decode an in-memory audio file.
     ///
-    /// This is the primary entry point for the audio normalization pipeline.
-    /// It composes all 4 stages: format detection, decoding, resampling, and
-    /// channel mixing.
+    /// ```no_run
+    /// use speech_prep::AudioFormatConverter;
     ///
-    /// # Arguments
-    ///
-    /// * `audio_bytes` - Raw audio file bytes
-    ///
-    /// # Returns
-    ///
-    /// `StandardAudio` with mono 16kHz samples and complete conversion
-    /// metadata.
+    /// # fn main() -> speech_prep::Result<()> {
+    /// let bytes = std::fs::read("recording.mp3")?;
+    /// let audio = AudioFormatConverter::convert_to_standard(&bytes)?;
+    /// println!("{:.1} s, originally {} Hz", audio.duration_sec(), audio.metadata.original_sample_rate);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if:
-    /// - Format detection fails (not a recognized audio format)
-    /// - Format is detected but not WAV (only WAV decoding supported)
-    /// - WAV decoding fails (malformed file, unsupported codec)
-    /// - Resampling fails (invalid sample rates)
-    /// - Channel mixing fails (unsupported channel count)
-    ///
-    /// # Performance
-    ///
-    /// Actual timing is captured in `ConversionMetadata.conversion_time_ms`.
-    /// Benchmark on your target hardware before making latency claims.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use speech_prep::converter::AudioFormatConverter;
-    ///
-    /// let audio_bytes = std::fs::read("recording.wav")?;
-    /// let standard = AudioFormatConverter::convert_to_standard(&audio_bytes)?;
-    ///
-    /// assert_eq!(standard.metadata.original_format.as_str(), "wav");
-    /// assert!(standard.samples.len() > 0);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    #[allow(clippy::cognitive_complexity)] // Large function — audio format conversion pipeline
+    /// - [`Error::InvalidInput`] if the bytes are not recognizable or are
+    ///   corrupt.
+    /// - [`Error::Unsupported`] if the format is recognized but cannot be
+    ///   decoded (Opus, or an unsupported codec inside a container).
     pub fn convert_to_standard(audio_bytes: &[u8]) -> Result<StandardAudio> {
-        let pipeline_start = AudioInstant::now();
+        Self::convert(audio_bytes, None)
+    }
 
-        tracing::debug!(
-            audio_bytes_len = audio_bytes.len(),
-            "Starting audio format conversion pipeline"
-        );
+    /// Read and decode an audio file from disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be read, otherwise the same as
+    /// [`convert_to_standard`](Self::convert_to_standard).
+    pub fn convert_file(path: impl AsRef<Path>) -> Result<StandardAudio> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)?;
+        Self::convert(&bytes, path.extension().and_then(|ext| ext.to_str()))
+    }
 
-        let detection_start = AudioInstant::now();
-        let format_metadata = FormatDetector::detect(audio_bytes)?;
-        let detection_duration = elapsed_since(detection_start);
-        let detection_time_ms = detection_duration.as_secs_f64() * 1000.0;
+    fn convert(audio_bytes: &[u8], extension: Option<&str>) -> Result<StandardAudio> {
+        let start = AudioInstant::now();
 
-        tracing::debug!(
-            format = %format_metadata.format,
-            detection_time_ms,
-            "Format detection complete"
-        );
-
-        if format_metadata.format != AudioFormat::WavPcm {
-            return Err(Error::InvalidInput(format!(
-                "unsupported format for decoding: {} (only WAV supported)",
-                format_metadata.format.as_str()
+        let decoded = decoder::decode(audio_bytes, extension)?;
+        let format = decoded.format;
+        if !SUPPORTED_INPUT_RATES.contains(&decoded.sample_rate) {
+            return Err(Error::Unsupported(format!(
+                "sample rate {} Hz is outside {}-{} Hz",
+                decoded.sample_rate,
+                SUPPORTED_INPUT_RATES.start(),
+                SUPPORTED_INPUT_RATES.end()
             )));
         }
+        if decoded.samples.iter().any(|s| !s.is_finite()) {
+            return Err(Error::InvalidInput(
+                "decoded audio contains NaN or infinite samples".into(),
+            ));
+        }
+        let peak_before = peak(&decoded.samples);
 
-        let decode_start = AudioInstant::now();
-        let decoded = WavDecoder::decode(audio_bytes)?;
-        let decode_duration = elapsed_since(decode_start);
-        let decode_time_ms = decode_duration.as_secs_f64() * 1000.0;
-
-        tracing::debug!(
-            sample_rate = decoded.sample_rate,
-            channels = decoded.channels,
-            bit_depth = decoded.bit_depth,
-            sample_count = decoded.samples.len(),
-            decode_time_ms,
-            "WAV decoding complete"
-        );
-
-        let peak_before = decoded
-            .samples
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
-
-        let resample_start = AudioInstant::now();
-        let resampled = SampleRateConverter::resample_to_16khz(
-            &decoded.samples,
-            decoded.channels,
-            decoded.sample_rate,
-        )?;
-        let resample_duration = elapsed_since(resample_start);
-        let resample_time_ms = resample_duration.as_secs_f64() * 1000.0;
-
-        tracing::debug!(
-            input_rate = decoded.sample_rate,
-            output_rate = SampleRateConverter::TARGET_SAMPLE_RATE,
-            output_samples = resampled.len(),
-            resample_time_ms,
-            "Sample rate conversion complete"
-        );
-
-        let mix_start = AudioInstant::now();
-        let mixed = ChannelMixer::mix_to_mono(&resampled, decoded.channels)?;
-        let mix_duration = elapsed_since(mix_start);
-        let mix_time_ms = mix_duration.as_secs_f64() * 1000.0;
-
-        tracing::debug!(
-            input_channels = decoded.channels,
-            output_samples = mixed.samples.len(),
-            peak_before_mix = mixed.peak_before_mix,
-            peak_after_mix = mixed.peak_after_mix,
-            mix_time_ms,
-            "Channel mixing complete"
-        );
-
-        let conversion_duration = elapsed_since(pipeline_start);
-        let conversion_time_ms = conversion_duration.as_secs_f64() * 1000.0;
-
-        if conversion_time_ms > 10.0 {
-            tracing::warn!(
-                conversion_time_ms,
-                detection_time_ms,
-                decode_time_ms,
-                resample_time_ms,
-                mix_time_ms,
-                "Audio conversion exceeded 10ms target latency"
-            );
-        } else {
-            tracing::debug!(conversion_time_ms, "Audio conversion pipeline complete");
+        let mono = ChannelMixer::mix_to_mono(&decoded.samples, decoded.channels)?;
+        let mut samples = SampleRateConverter::resample_to_16khz(&mono, decoded.sample_rate)?;
+        // Float input may exceed full scale, and the resampler can overshoot
+        // slightly on hard edges.
+        for sample in &mut samples {
+            *sample = sample.clamp(-1.0, 1.0);
         }
 
         let metadata = ConversionMetadata {
-            original_format: format_metadata.format,
+            original_format: format,
             original_sample_rate: decoded.sample_rate,
             original_channels: decoded.channels,
-            original_bit_depth: Some(decoded.bit_depth),
+            original_bit_depth: decoded.bit_depth,
             peak_before,
-            peak_after: mixed.peak_after_mix,
-            conversion_time_ms,
-            detection_time_ms,
-            decode_time_ms,
-            resample_time_ms,
-            mix_time_ms,
+            peak_after: peak(&samples),
+            conversion_time: start.elapsed(),
         };
 
-        Ok(StandardAudio {
-            samples: mixed.samples,
-            metadata,
-        })
+        tracing::debug!(
+            format = %format,
+            sample_rate = decoded.sample_rate,
+            channels = decoded.channels,
+            output_samples = samples.len(),
+            elapsed_us = metadata.conversion_time.as_micros(),
+            "converted audio to 16 kHz mono"
+        );
+
+        Ok(StandardAudio { samples, metadata })
     }
 }
 
-fn elapsed_since(start: AudioInstant) -> AudioDuration {
-    AudioInstant::now().duration_since(start)
+fn peak(samples: &[f32]) -> f32 {
+    samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    type TestResult<T> = std::result::Result<T, String>;
-
-    /// Create a minimal valid WAV file for testing.
-    fn create_test_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> TestResult<Vec<u8>> {
+    fn wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
         let spec = hound::WavSpec {
             sample_rate,
             channels,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
-
         let mut cursor = std::io::Cursor::new(Vec::new());
-        let mut writer = hound::WavWriter::new(&mut cursor, spec)
-            .map_err(|e| format!("failed to create WAV writer: {e}"))?;
-
-        for &sample in samples {
-            writer
-                .write_sample(sample)
-                .map_err(|e| format!("failed to write sample: {e}"))?;
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
         }
-
-        writer
-            .finalize()
-            .map_err(|e| format!("failed to finalize WAV: {e}"))?;
-
-        Ok(cursor.into_inner())
+        writer.finalize().unwrap();
+        cursor.into_inner()
     }
 
     #[test]
-    fn test_convert_mono_16khz_identity() -> TestResult<()> {
-        // Already in standard format: mono, 16kHz
-        let samples = vec![100i16, 200, -100, -200]; // Small amplitude
-        let wav = create_test_wav(16000, 1, &samples)?;
-
+    fn mono_16khz_passes_through() {
         let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
+            AudioFormatConverter::convert_to_standard(&wav(16_000, 1, &[100, 200, -100, -200]))
+                .unwrap();
 
-        // Should have 4 samples (already 16kHz mono)
         assert_eq!(standard.samples.len(), 4);
-        assert_eq!(standard.metadata.original_sample_rate, 16000);
-        assert_eq!(standard.metadata.original_channels, 1);
         assert_eq!(standard.metadata.original_format, AudioFormat::WavPcm);
-
-        Ok(())
+        assert_eq!(standard.metadata.original_sample_rate, 16_000);
+        assert_eq!(standard.metadata.original_channels, 1);
+        assert_eq!(standard.metadata.original_bit_depth, Some(16));
     }
 
     #[test]
-    fn test_convert_stereo_44100_to_standard() -> TestResult<()> {
-        // Stereo 44.1kHz → mono 16kHz
-        let samples = vec![1000i16, -1000, 2000, -2000]; // 2 stereo frames
-        let wav = create_test_wav(44100, 2, &samples)?;
-
+    fn stereo_44100_is_mixed_and_resampled() {
+        let frames = 44_100;
+        let samples: Vec<i16> = (0..frames).flat_map(|_| [8_000i16, 8_000]).collect();
         let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
+            AudioFormatConverter::convert_to_standard(&wav(44_100, 2, &samples)).unwrap();
 
-        // Should have ~1 sample after downsampling 44.1kHz → 16kHz and mixing stereo →
-        // mono Original: 2 frames at 44.1kHz = ~0.045ms
-        // At 16kHz: ~0.045ms * 16000 = ~0.72 samples (rounds to 1)
-        assert!(!standard.samples.is_empty());
-        assert_eq!(standard.metadata.original_sample_rate, 44100);
+        assert_eq!(standard.samples.len(), 16_000);
         assert_eq!(standard.metadata.original_channels, 2);
-
-        Ok(())
+        assert!((standard.duration_sec() - 1.0).abs() < 1e-3);
     }
 
     #[test]
-    fn test_convert_tracks_timing() -> TestResult<()> {
-        let samples = vec![0i16; 1000]; // 1000 samples
-        let wav = create_test_wav(16000, 1, &samples)?;
-
+    fn tracks_peaks() {
         let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
+            AudioFormatConverter::convert_to_standard(&wav(16_000, 1, &[10_000, -10_000, 5_000]))
+                .unwrap();
 
-        // All timing fields should be populated
-        assert!(standard.metadata.detection_time_ms >= 0.0);
-        assert!(standard.metadata.decode_time_ms >= 0.0);
-        assert!(standard.metadata.resample_time_ms >= 0.0);
-        assert!(standard.metadata.mix_time_ms >= 0.0);
-        assert!(standard.metadata.conversion_time_ms >= 0.0);
-
-        // Total time should be sum of stages (approximately, with measurement overhead)
-        let stage_sum = standard.metadata.detection_time_ms
-            + standard.metadata.decode_time_ms
-            + standard.metadata.resample_time_ms
-            + standard.metadata.mix_time_ms;
-
-        assert!(
-            (standard.metadata.conversion_time_ms - stage_sum).abs() < 1.0,
-            "total time {} should approximately equal stage sum {}",
-            standard.metadata.conversion_time_ms,
-            stage_sum
-        );
-
-        Ok(())
+        let expected = 10_000.0 / 32_768.0;
+        assert!((standard.metadata.peak_before - expected).abs() < 1e-4);
+        assert!((standard.metadata.peak_ratio() - 1.0).abs() < 1e-4);
     }
 
     #[test]
-    fn test_convert_tracks_peaks() -> TestResult<()> {
-        // Create audio with known peak
-        let samples = vec![10000i16, -10000, 5000, -5000]; // Peak: 10000/32768 ≈ 0.305
-        let wav = create_test_wav(16000, 1, &samples)?;
-
-        let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
-
-        // Should track peaks
-        assert!(standard.metadata.peak_before > 0.0);
-        assert!(standard.metadata.peak_after > 0.0);
-
-        // Peak should be approximately 0.305
-        assert!(
-            (standard.metadata.peak_before - 0.305).abs() < 0.01,
-            "expected peak ~0.305, got {}",
-            standard.metadata.peak_before
-        );
-
-        Ok(())
+    fn opposite_phase_stereo_cancels() {
+        let standard = AudioFormatConverter::convert_to_standard(&wav(
+            16_000,
+            2,
+            &[10_000, -10_000, 5_000, -5_000],
+        ))
+        .unwrap();
+        assert!(standard.is_silent());
+        assert!(standard.metadata.peak_ratio() < 0.01);
     }
 
     #[test]
-    fn test_convert_rejects_non_wav() {
-        // Create fake MP3 header
-        let mp3_bytes = vec![0xFF, 0xFB, 0x90, 0x00]; // Valid MP3 frame start
-
-        let result = AudioFormatConverter::convert_to_standard(&mp3_bytes);
-
-        // Should detect as MP3 but reject for decoding (only WAV supported)
+    fn rejects_bytes_that_only_look_like_mp3() {
+        let result = AudioFormatConverter::convert_to_standard(&[0xFF, 0xFB, 0x90, 0x00]);
         assert!(result.is_err());
-        if let Err(err) = result {
-            let err_msg = err.to_string();
-            assert!(err_msg.contains("MP3") || err_msg.contains("unsupported"));
+    }
+
+    fn float_wav(samples: &[f32]) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn output_is_clamped_to_full_scale() {
+        let standard =
+            AudioFormatConverter::convert_to_standard(&float_wav(&[2.0, -3.0, 0.5])).unwrap();
+        assert_eq!(standard.samples, vec![1.0, -1.0, 0.5]);
+        assert_eq!(standard.metadata.peak_before, 3.0);
+        assert_eq!(standard.metadata.peak_after, 1.0);
+    }
+
+    #[test]
+    fn rejects_non_finite_samples() {
+        for bad in [f32::NAN, f32::INFINITY] {
+            let err =
+                AudioFormatConverter::convert_to_standard(&float_wav(&[0.1, bad])).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
         }
     }
 
     #[test]
-    fn test_standard_audio_duration_calculation() -> TestResult<()> {
-        let samples = vec![0i16; 16000]; // 1 second at 16kHz
-        let wav = create_test_wav(16000, 1, &samples)?;
-
-        let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
-
-        // Should be 1.0 second
-        assert!((standard.duration_sec() - 1.0).abs() < 0.01);
-
-        Ok(())
+    fn resampled_output_stays_in_range() {
+        // A full-scale square wave makes the sinc filter ring past ±1.
+        let square: Vec<i16> = (0..44_100)
+            .map(|i| {
+                if (i / 50) % 2 == 0 {
+                    i16::MAX
+                } else {
+                    i16::MIN
+                }
+            })
+            .collect();
+        let standard = AudioFormatConverter::convert_to_standard(&wav(44_100, 1, &square)).unwrap();
+        assert!(standard.samples.iter().all(|s| (-1.0..=1.0).contains(s)));
     }
 
     #[test]
-    fn test_standard_audio_is_silent_detection() -> TestResult<()> {
-        let silent_samples = vec![0i16; 100];
-        let wav = create_test_wav(16000, 1, &silent_samples)?;
-
-        let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
-
-        assert!(standard.is_silent());
-
-        Ok(())
+    fn rejects_implausible_sample_rates() {
+        for rate in [1_000, 1_040_220_288] {
+            let err =
+                AudioFormatConverter::convert_to_standard(&wav(rate, 1, &[0; 16])).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{rate} Hz: {err:?}");
+        }
     }
 
     #[test]
-    fn test_conversion_metadata_peak_ratio() -> TestResult<()> {
-        let samples = vec![10000i16, -10000];
-        let wav = create_test_wav(16000, 1, &samples)?;
-
-        let standard =
-            AudioFormatConverter::convert_to_standard(&wav).map_err(|e| e.to_string())?;
-
-        // Peak ratio should be close to 1.0 for mono 16kHz (no mixing/resampling
-        // changes)
-        assert!(
-            (standard.metadata.peak_ratio() - 1.0).abs() < 0.1,
-            "expected peak ratio ~1.0, got {}",
-            standard.metadata.peak_ratio()
-        );
-
-        Ok(())
+    fn convert_file_reports_io_errors() {
+        let err = AudioFormatConverter::convert_file("/nonexistent/file.wav").unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
     }
 }

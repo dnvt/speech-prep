@@ -1,54 +1,48 @@
-//! Audio chunking aligned to VAD segments.
+//! Split audio into chunks aligned with speech segments.
 //!
-//! This module segments standardized PCM audio into speech-aligned chunks with
-//! timing and overlap metadata.
+//! Given samples and the [`SpeechChunk`]s from a VAD, [`Chunker`] covers the
+//! whole input with contiguous chunks:
 //!
-//! # Architecture
+//! ```text
+//! audio   |------ silence ------|========== speech ==========|--- silence ---|
+//! chunks  [  Silence           ][ Start ][ Cont. ][   End    ][  Silence     ]
+//!                                 ~target_duration each
+//! ```
 //!
-//! The chunker follows a streaming-first design:
-//! 1. Accept VAD boundaries (`SpeechChunk`) + raw PCM samples
-//! 2. Generate fixed-duration chunks (default 500ms) aligned to speech
-//!    boundaries
-//! 3. Attach temporal metadata (`AudioTimestamp`) for deterministic testing
-//! 4. Attach quality metrics such as energy and speech ratio
+//! Silence between segments becomes one chunk. Speech segments are split
+//! into pieces close to `target_duration` (never longer than
+//! `max_duration`), and short tails are merged into the previous piece.
+//! Every chunk gets energy, speech ratio, SNR (when a noise baseline is
+//! available), and a copy of the neighbouring samples in `overlap_prev` /
+//! `overlap_next` for models that need context across boundaries.
 //!
-//! # Performance Contracts
-//!
-//! - **Latency**: <15ms total processing per chunk
-//! - **Alignment**: ±20ms accuracy to VAD boundaries
-//! - **Coverage**: Chunks cover 100% of input duration (no gaps)
-//!
-//! # Example
-//!
-//! ```rust
-//! use speech_prep::{Chunker, ChunkerConfig, SpeechChunk};
+//! ```
 //! use speech_prep::time::{AudioDuration, AudioTimestamp};
+//! use speech_prep::{Chunker, SpeechChunk};
 //!
-//! let config = ChunkerConfig::default(); // 500ms chunks
-//! let chunker = Chunker::new(config);
+//! # fn main() -> speech_prep::Result<()> {
+//! let chunker = Chunker::default(); // 500 ms target
 //!
-//! let audio: Vec<f32> = vec![0.0; 16000]; // 1 second @ 16kHz
-//! let vad_segments = vec![SpeechChunk {
-//!     start_time:  AudioTimestamp::EPOCH,
-//!     end_time:    AudioTimestamp::EPOCH
-//!         .add_duration(AudioDuration::from_secs(1)),
-//!     confidence:  0.9,
-//!     avg_energy:  0.5,
+//! let audio = vec![0.0f32; 16_000]; // 1 s at 16 kHz
+//! let speech = SpeechChunk {
+//!     start_time: AudioTimestamp::EPOCH,
+//!     end_time: AudioTimestamp::EPOCH + AudioDuration::from_secs(1),
+//!     confidence: 0.9,
+//!     avg_energy: 0.5,
 //!     frame_count: 50,
-//! }];
+//! };
 //!
-//! let chunks = chunker.chunk(&audio, 16000, &vad_segments)?;
-//! assert_eq!(chunks.len(), 2); // Two 500ms chunks from 1s speech
-//!
-//! // Overlaps are automatically added between chunks
-//! assert!(chunks[0].overlap_next.is_some()); // First chunk has overlap for next
-//! assert!(chunks[1].overlap_prev.is_some()); // Second chunk has overlap from prev
-//! # Ok::<(), speech_prep::error::Error>(())
+//! let chunks = chunker.chunk(&audio, 16_000, &[speech])?;
+//! assert_eq!(chunks.len(), 2);
+//! assert!(chunks[0].overlap_next.is_some());
+//! assert!(chunks[1].overlap_prev.is_some());
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::error::{Error, Result};
 use crate::time::AudioTimestamp;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::SpeechChunk;
 
@@ -60,62 +54,35 @@ mod segments;
 mod types;
 
 pub use config::ChunkerConfig;
-use overlap::apply_overlaps;
+pub(crate) use overlap::apply_overlaps;
 pub use types::{ChunkBoundary, ProcessedChunk};
 
-/// Audio chunker for segmenting streams into processing units.
-///
-/// Combines VAD boundaries with duration heuristics to produce processing-size
-/// chunks.
-#[derive(Debug, Clone, Copy)]
+/// Splits audio into speech-aligned chunks. See the [module docs](self).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Chunker {
     config: ChunkerConfig,
 }
 
-#[allow(clippy::multiple_inherent_impl)]
 impl Chunker {
-    /// Create a new chunker with the given configuration.
+    /// Create a chunker with the given configuration.
     #[must_use]
     pub fn new(config: ChunkerConfig) -> Self {
         Self { config }
     }
 
-    /// Create a chunker with default configuration (500ms chunks).
-    ///
-    /// Alias for `Chunker::new(ChunkerConfig::default())`.
+    /// The configuration this chunker was built with.
     #[must_use]
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> Self {
-        Self::new(ChunkerConfig::default())
+    pub fn config(&self) -> &ChunkerConfig {
+        &self.config
     }
 
-    /// Segment audio into processing chunks aligned to VAD boundaries.
-    ///
-    /// This variant assumes the VAD timestamps use the zero-based origin from
-    /// `AudioTimestamp::EPOCH`. If the timestamps already include a stream
-    /// offset, prefer [`Chunker::chunk_with_stream_start`].
-    ///
-    /// # Arguments
-    ///
-    /// - `audio`: Raw PCM samples (f32, normalized to [-1.0, 1.0])
-    /// - `sample_rate`: Audio sample rate in Hz (must be > 0)
-    /// - `vad_segments`: Speech boundaries from VAD analysis
-    ///
-    /// # Returns
-    ///
-    /// Vector of `ProcessedChunk` covering the entire input duration with no
-    /// gaps.
+    /// Chunk `audio`, interpreting VAD timestamps as relative to
+    /// [`AudioTimestamp::EPOCH`].
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if:
-    /// - `sample_rate` is zero
-    /// - `audio` is empty
-    /// - VAD segments have invalid timestamps (end < start)
-    ///
-    /// # Performance
-    ///
-    /// Target: <15ms total processing time per chunk generated.
+    /// Returns [`Error::InvalidInput`] if `sample_rate` is zero, `audio` is
+    /// empty, or a segment ends before it starts.
     pub fn chunk(
         &self,
         audio: &[f32],
@@ -125,34 +92,14 @@ impl Chunker {
         self.chunk_with_stream_start(audio, sample_rate, vad_segments, AudioTimestamp::EPOCH)
     }
 
-    /// Segment audio into processing chunks with an explicit stream start time.
+    /// Chunk `audio` whose first sample is at `stream_start_time`.
     ///
-    /// Use this variant when the VAD timestamps should be interpreted relative
-    /// to a known stream start rather than zero-based.
+    /// Use this when the VAD timestamps include a stream offset, for example
+    /// when processing the second minute of a live stream.
     ///
-    /// ```
-    /// use speech_prep::{Chunker, ChunkerConfig, SpeechChunk};
-    /// use speech_prep::time::{AudioDuration, AudioTimestamp};
+    /// # Errors
     ///
-    /// # fn main() -> speech_prep::error::Result<()> {
-    /// let chunker = Chunker::new(ChunkerConfig::streaming());
-    /// let stream_start = AudioTimestamp::EPOCH;
-    ///
-    /// // VAD emits wall-clock timestamps relative to the live stream
-    /// let segments = vec![SpeechChunk {
-    ///     start_time:  stream_start,
-    ///     end_time:    stream_start.add_duration(AudioDuration::from_millis(240)),
-    ///     confidence:  0.92,
-    ///     avg_energy:  0.4,
-    ///     frame_count: 48,
-    /// }];
-    ///
-    /// let audio = vec![0.0; 3840]; // 240ms @ 16kHz
-    /// let chunks = chunker.chunk_with_stream_start(&audio, 16_000, &segments, stream_start)?;
-    /// assert_eq!(chunks.len(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Same as [`chunk`](Self::chunk).
     pub fn chunk_with_stream_start(
         &self,
         audio: &[f32],
@@ -175,26 +122,26 @@ impl Chunker {
             }
         }
 
-        let processing_start = Instant::now();
+        let segments = merge_segments(vad_segments);
 
         let total_samples = audio.len();
         let total_duration_secs = total_samples as f64 / f64::from(sample_rate);
         let total_duration = Duration::from_secs_f64(total_duration_secs);
 
-        let earliest_segment_start = vad_segments.iter().map(|seg| seg.start_time).min();
+        let earliest_segment_start = segments.iter().map(|seg| seg.start_time).min();
         let audio_start = earliest_segment_start.map_or(stream_start_time, |start| {
             std::cmp::min(start, stream_start_time)
         });
 
         let noise_baseline =
-            Self::compute_noise_baseline(audio, sample_rate, vad_segments, audio_start);
+            Self::compute_noise_baseline(audio, sample_rate, &segments, audio_start);
 
         let estimated_chunks =
             (total_duration.as_millis() / self.config.target_duration.as_millis()).max(1) as usize
                 + 1;
         let mut chunks = Vec::with_capacity(estimated_chunks);
 
-        if vad_segments.is_empty() {
+        if segments.is_empty() {
             chunks.push(Self::create_silence_chunk(
                 audio,
                 sample_rate,
@@ -205,7 +152,7 @@ impl Chunker {
         } else {
             let mut current_time = audio_start;
 
-            for segment in vad_segments {
+            for segment in &segments {
                 if segment.start_time > current_time {
                     let silence_end = segment.start_time;
                     let silence_duration =
@@ -252,14 +199,32 @@ impl Chunker {
         let overlap_samples = Self::duration_to_samples(self.config.overlap_duration, sample_rate);
         apply_overlaps(&mut chunks, overlap_samples, sample_rate);
 
-        let latency = processing_start.elapsed();
-        let chunk_count = chunks.len().max(1);
-        let _per_chunk = Duration::from_secs_f64(latency.as_secs_f64() / chunk_count as f64);
-        for _ in 0..chunk_count {}
-
         Ok(chunks)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// Sort segments by start time and merge any that overlap, so the chunker
+/// never emits the same audio twice.
+fn merge_segments(segments: &[SpeechChunk]) -> Vec<SpeechChunk> {
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|seg| seg.start_time);
+
+    let mut merged: Vec<SpeechChunk> = Vec::with_capacity(sorted.len());
+    for seg in sorted {
+        match merged.last_mut() {
+            Some(prev) if seg.start_time < prev.end_time => {
+                let frames = prev.frame_count + seg.frame_count;
+                let weight = |s: &SpeechChunk| s.frame_count as f32 / frames.max(1) as f32;
+                prev.confidence = prev.confidence * weight(prev) + seg.confidence * weight(&seg);
+                prev.avg_energy = prev.avg_energy * weight(prev) + seg.avg_energy * weight(&seg);
+                prev.end_time = prev.end_time.max(seg.end_time);
+                prev.frame_count = frames;
+            }
+            _ => merged.push(seg),
+        }
+    }
+    merged
+}
