@@ -31,5 +31,5 @@ ffmpeg $q -i tone.flac $small -c:a libopus -b:a 24k tone-opus.webm
 
 # Safety fixtures: a FLAC cut mid-stream (truncated), and a decompression
 # bomb (minutes of silence that decode past the sample cap but compress tiny).
-head -c 8000 tone.flac > tone-truncated.flac
+head -c 16000 tone.flac > tone-truncated.flac
 ffmpeg $q -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 780 -c:a flac tone-bomb.flac
