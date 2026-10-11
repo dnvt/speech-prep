@@ -72,9 +72,11 @@ impl PreprocessingConfig {
             ));
         }
 
-        if self.highpass_cutoff_hz < 20.0 {
+        // The `is_finite` guard rejects NaN and infinity, which would
+        // otherwise pass every comparison and poison the filter output.
+        if !(self.highpass_cutoff_hz.is_finite() && self.highpass_cutoff_hz >= 20.0) {
             return Err(Error::Configuration(format!(
-                "highpass_cutoff_hz {:.1} is below the 20 Hz minimum",
+                "highpass_cutoff_hz {:.1} must be a finite value of at least 20 Hz",
                 self.highpass_cutoff_hz
             )));
         }
@@ -87,7 +89,7 @@ impl PreprocessingConfig {
             )));
         }
 
-        if self.dc_bias_alpha <= 0.0 || self.dc_bias_alpha >= 1.0 {
+        if !(self.dc_bias_alpha > 0.0 && self.dc_bias_alpha < 1.0) {
             return Err(Error::Configuration(format!(
                 "dc_bias_alpha {:.3} must be in (0, 1)",
                 self.dc_bias_alpha
@@ -338,6 +340,37 @@ mod tests {
 
     // Test helper type
     type TestResult<T> = std::result::Result<T, String>;
+
+    #[test]
+    fn non_finite_config_is_rejected() {
+        let base = PreprocessingConfig::default();
+        let bad = [
+            PreprocessingConfig {
+                highpass_cutoff_hz: f32::NAN,
+                ..base
+            },
+            PreprocessingConfig {
+                highpass_cutoff_hz: f32::INFINITY,
+                ..base
+            },
+            PreprocessingConfig {
+                dc_bias_alpha: f32::NAN,
+                ..base
+            },
+            PreprocessingConfig {
+                dc_bias_alpha: 0.0,
+                ..base
+            },
+            PreprocessingConfig {
+                dc_bias_alpha: 1.0,
+                ..base
+            },
+        ];
+        for cfg in bad {
+            assert!(cfg.validate().is_err(), "should reject {cfg:?}");
+        }
+        assert!(base.validate().is_ok());
+    }
 
     // Generate sine wave for testing
     fn generate_sine_wave(

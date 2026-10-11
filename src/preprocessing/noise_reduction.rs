@@ -174,6 +174,15 @@ pub struct NoiseReducer {
     window: Vec<f32>,
     noise_profile: Vec<f32>,
     noise_initialized: bool,
+    /// Tail of the previous `reduce` call, used as real left-hand context for
+    /// the analysis windows at the start of the next call. Without it each
+    /// call zero-pads its own left edge, so once a noise profile is learned
+    /// the spectral subtraction on those zero-padded frames leaves a
+    /// discontinuity at chunk boundaries. Cleared by [`reset`](Self::reset).
+    history: Vec<f32>,
+    /// Samples seen since creation or [`reset`](Self::reset), so each call
+    /// places its analysis frames on the same hop grid as one long call.
+    consumed: u64,
 }
 
 impl std::fmt::Debug for NoiseReducer {
@@ -215,6 +224,8 @@ impl NoiseReducer {
             config,
             fft_forward,
             fft_inverse,
+            history: Vec::new(),
+            consumed: 0,
         })
     }
 
@@ -246,13 +257,35 @@ impl NoiseReducer {
         let mut output = vec![0.0f32; padded_len];
         let mut weight = vec![0.0f32; padded_len];
 
+        // Real left-hand context from the previous call (its last `pad`
+        // samples), so the opening frames analyze actual audio instead of
+        // zeros. The right pad has no future context and stays zero; that
+        // edge is re-covered with real context on the next call. Cloned to a
+        // local (at most one frame) so it does not borrow `self` across the
+        // `&mut self` FFT calls below.
+        let left_ctx = self.history.clone();
+
+        // Start on the stream's hop grid: frame starts sit at multiples of
+        // the hop measured from the first sample ever seen, offset by the
+        // pad. Restarting the grid at each call would analyze the two sides
+        // of a boundary with differently placed windows.
+        let hop = hop_length as u64;
+        let mut pos = ((hop - self.consumed % hop) % hop) as usize;
         let mut frame = vec![0.0f32; frame_length];
-        let mut pos = 0;
         while pos + frame_length <= padded_len {
             for (i, slot) in frame.iter_mut().enumerate() {
                 let idx = pos + i;
                 *slot = if (pad..pad + samples.len()).contains(&idx) {
                     samples.get(idx - pad).copied().unwrap_or(0.0)
+                } else if idx < pad {
+                    // Left pad: map idx to a sample `pad - idx` before the
+                    // chunk start, taken from the tail of the previous call.
+                    left_ctx
+                        .len()
+                        .checked_sub(pad - idx)
+                        .and_then(|k| left_ctx.get(k))
+                        .copied()
+                        .unwrap_or(0.0)
                 } else {
                     0.0
                 };
@@ -286,6 +319,13 @@ impl NoiseReducer {
             })
             .collect();
 
+        // Keep the last `pad` samples of the stream as left-context for the
+        // next call, including older history when this call was short.
+        self.history.extend_from_slice(samples);
+        let excess = self.history.len().saturating_sub(pad);
+        self.history.drain(..excess);
+        self.consumed = self.consumed.wrapping_add(samples.len() as u64);
+
         Ok(result)
     }
 
@@ -293,6 +333,8 @@ impl NoiseReducer {
     pub fn reset(&mut self) {
         self.noise_profile.fill(INITIAL_NOISE_MAGNITUDE);
         self.noise_initialized = false;
+        self.history.clear();
+        self.consumed = 0;
     }
 
     /// Mean of the noise magnitude spectrum, for diagnostics.
@@ -923,6 +965,60 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err < 1e-3, "max reconstruction error {max_err}");
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_leading_edge_matches_single_call() -> TestResult<()> {
+        // With a learned noise profile, splitting a continuous signal across
+        // reduce() calls used to leave a discontinuity at each boundary
+        // because every call zero-padded its left edge and restarted its STFT
+        // grid. With left-context and the hop grid carried across calls, the
+        // leading samples after the last split match a single-call denoise.
+        // Splits cover a hop-aligned cut, an unaligned cut (8037 is not a
+        // multiple of the 160-sample hop), and a 50-sample call shorter than
+        // the analysis frame in between.
+        let noise = generate_sine_wave(60.0, 16000, 0.25, 0.01);
+        let signal = generate_sine_wave(440.0, 16000, 1.0, 0.3);
+
+        let make = || -> TestResult<NoiseReducer> {
+            let mut r =
+                NoiseReducer::new(NoiseReductionConfig::default()).map_err(|e| e.to_string())?;
+            r.reduce(&noise, Some(VadContext { is_silence: true }))
+                .map_err(|e| e.to_string())?;
+            Ok(r)
+        };
+        let speech = Some(VadContext { is_silence: false });
+
+        let mut one = make()?;
+        let single = one.reduce(&signal, speech).map_err(|e| e.to_string())?;
+
+        for cuts in [vec![8000], vec![8037], vec![8037, 8087]] {
+            let mut split = make()?;
+            let mut chunked = Vec::new();
+            let mut start = 0;
+            for &end in cuts.iter().chain(std::iter::once(&signal.len())) {
+                chunked.extend(
+                    split
+                        .reduce(signal.get(start..end).unwrap_or(&[]), speech)
+                        .map_err(|e| e.to_string())?,
+                );
+                start = end;
+            }
+
+            // The first 64 samples after the last cut.
+            let last = cuts.last().copied().unwrap_or(0);
+            let max_edge = (last..last + 64)
+                .map(|i| {
+                    (chunked.get(i).copied().unwrap_or(0.0) - single.get(i).copied().unwrap_or(0.0))
+                        .abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_edge < 1e-6,
+                "cuts {cuts:?}: leading-edge seam {max_edge} (should be ~0)"
+            );
+        }
         Ok(())
     }
 }

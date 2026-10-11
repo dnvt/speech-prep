@@ -6,6 +6,30 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The noise floor's slow rise during speech now has the same time constant
+  (5 s) at any frame hop. It was a fixed per-frame factor, so with
+  `frame_overlap: 0.75` steady noise under speech was absorbed in half the
+  time, and with no overlap in twice the time. Defaults are unchanged.
+- `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
+  the sign check and silently turned detection off.
+- `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
+  `dc_bias_alpha`, which previously passed and turned the filter output into
+  `NaN`.
+- A `ChunkerConfig` built as a struct literal with a sub-millisecond
+  `target_duration` is now `Error::Configuration` from `Chunker::chunk`
+  instead of a divide-by-zero panic.
+- `NoiseReducer` now carries the last frame of the stream as real left-hand
+  context and keeps its STFT frames on one hop grid across calls, so a
+  continuous signal split across calls (at any sample, in blocks of any size)
+  no longer has a discontinuity at the leading edge of each chunk once a noise
+  profile is learned (previously each call zero-padded its own left edge and
+  restarted its frame grid). The trailing
+  edge of a call still lacks future context and is re-covered on the next
+  call; eliminating that residual entirely would require an output-lagging
+  (buffered) API, which is a separate change.
+
 ## [0.2.0] - 2026-10-11
 
 ### Upgrading from 0.1
