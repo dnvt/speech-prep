@@ -10,8 +10,9 @@
 //! feature, Opus input is rejected with [`Error::Unsupported`].
 //!
 //! Any channel count is accepted and averaged to mono. Resampling uses a
-//! windowed-sinc filter that passes up to 7.2 kHz and removes content above
-//! 8 kHz instead of letting it alias.
+//! windowed-sinc filter that is flat to about 6.6 kHz and rolls off above it
+//! (-6 dB near 7.2 kHz), strongly attenuating content near and above the 8 kHz
+//! output Nyquist instead of letting it alias.
 
 use std::path::Path;
 use std::time::Duration;

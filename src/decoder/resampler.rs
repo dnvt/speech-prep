@@ -17,8 +17,9 @@ pub(crate) struct SampleRateConverter;
 /// sharper transition band at a higher cost.
 const ZERO_CROSSINGS: usize = 24;
 
-/// Passband edge as a fraction of the lower of the two Nyquist frequencies.
-/// For 16 kHz output that is 7.2 kHz.
+/// Sinc cutoff as a fraction of the lower of the two Nyquist frequencies (the
+/// -6 dB point, not the flat passband edge). For 16 kHz output that is 7.2 kHz;
+/// the response is flat to roughly 6.6 kHz.
 const CUTOFF: f64 = 0.9;
 
 /// Kaiser window shape; 8.0 gives roughly 80 dB stopband attenuation.

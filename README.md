@@ -80,7 +80,8 @@ fn main() -> speech_prep::Result<()> {
 
 | Codec | Containers | Decoded |
 |-------|------------|:-------:|
-| PCM (integer, float, mu-law, A-law) | WAV, AIFF, CAF | yes |
+| PCM (integer, float) | WAV, AIFF, CAF | yes |
+| PCM (mu-law, A-law) | WAV, AIFF | yes |
 | ADPCM (Microsoft, IMA) | WAV | yes |
 | FLAC | FLAC, Ogg | yes |
 | ALAC | MP4/M4A, CAF | yes |
@@ -102,9 +103,11 @@ accepted.
 
 ## Limitations
 
-- **Resampling** uses a windowed-sinc low-pass filter. Content between
-  7.2 and 8 kHz is rolled off and everything above 8 kHz is removed, so the
-  16 kHz output keeps the speech band but not the top of the spectrum.
+- **Resampling** uses a windowed-sinc low-pass filter. The response is flat to
+  about 6.6 kHz and rolls off from there (about -3 dB at 7.1 kHz, -6 dB at
+  7.2 kHz), with everything near and above the 8 kHz output Nyquist strongly
+  attenuated. The 16 kHz output keeps the speech band but not the top of the
+  spectrum.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
   (`activation_ratio`, `hangover_frames`, `speech_padding`).
