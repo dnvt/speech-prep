@@ -4,14 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] - 0.2.0
+## [Unreleased]
+
+## [0.2.0] - 2026-10-11
 
 ### Added
 
 - Decoding of FLAC, ALAC, MP3, AAC (MP4/M4A), Ogg/WebM Vorbis, AIFF, CAF,
   and ADPCM through Symphonia 0.6, plus 8-bit, 32-bit, float, mu-law, and
-  A-law WAV. Any channel count is
-  downmixed to mono.
+  A-law WAV. Any channel count is downmixed to mono.
 - `AudioFormatConverter::convert_file` for reading from a path.
 - `Pipeline::process_samples` for already-decoded 16 kHz audio, and
   `Pipeline::reset`.
@@ -25,7 +26,8 @@ uses [Semantic Versioning](https://semver.org/).
   `process_samples` calls.
 - `VadDetector::flush` to analyze the last partial frame and close a segment
   that runs to the end of the stream.
-- `Error::Unsupported` for recognized but undecodable formats (Opus).
+- `Error::Unsupported` for recognized formats that can't be decoded, such
+  as Opus without the `opus` feature (the message names the feature).
 - Opus decoding (Ogg and WebM) behind the optional `opus` feature, using the
   pure-Rust `ruopus` decoder. Its output matches libopus to within float
   rounding (121 dB SNR on speech). It is off by default because it adds
@@ -57,8 +59,6 @@ uses [Semantic Versioning](https://semver.org/).
   almost every segment.
 - **Breaking:** `ConversionMetadata` reports a single `conversion_time` and
   `original_channels` is a `u16`.
-- Opus input without the `opus` feature is `Error::Unsupported` with a
-  message naming the feature.
 - **Breaking:** `AudioFormat` names the codec, not the container, and is
   `#[non_exhaustive]`: `WebM` is gone (a WebM file reports `Vorbis` or
   `Opus`), `Alac` and `Adpcm` are new. `FormatDetector::detect` always
@@ -72,8 +72,9 @@ uses [Semantic Versioning](https://semver.org/).
 - **Breaking:** configuration validation errors are `Error::Configuration`
   everywhere; `Error` is `#[non_exhaustive]`.
 - The VAD noise floor is seeded from the quietest frame of the first
-  300 ms and track the noise floor during speech too. Before, a recording that started with
-  noise above the energy gate was classified as one long speech segment.
+  300 ms and keeps adapting during speech. Before, a recording that started
+  with noise above the energy gate was classified as one long speech
+  segment.
 - The default `hangover_frames` is 20 (200 ms) instead of 3 (30 ms; the
   docs said 60 ms), and hangover frames no longer extend a segment's end.
   Segments get 50 ms of padding on each side (`VadConfig::speech_padding`,
@@ -83,13 +84,14 @@ uses [Semantic Versioning](https://semver.org/).
   from 0.89 to 0.95.
 - `VadStats::speech_frames` counts frames that measured as speech; hangover
   frames now count as silence.
-- With that fixed, the default VAD energy gate is 40x lower (0.0005 instead
-  of 0.02). The old value missed 60% of speech peaking at -6 dBFS and all
-  speech at -20 dBFS in a synthesized test set.
+- Because the noise floor now adapts, the default VAD energy gate is 40x
+  lower (0.0005 instead of 0.02). The old value missed 60% of speech
+  peaking at -6 dBFS and all speech at -20 dBFS in a synthesized test set.
 - Channels are mixed to mono before resampling instead of after.
 - Resampling uses a Kaiser-windowed sinc filter instead of linear
   interpolation. A 12 kHz tone at 48 kHz used to alias to 4 kHz at full
   level; it is now attenuated by about 100 dB.
+- **Licensing:** the crate is now MIT only (0.1.x was MIT OR Apache-2.0).
 - Edition 2024. Cargo now resolves dependencies against `rust-version`, so
   1.87 builds without pinning anything.
 - Library code no longer logs at `info`/`warn` on every call or warns when a
@@ -118,9 +120,9 @@ uses [Semantic Versioning](https://semver.org/).
   and the chunker emitted the overlapping audio twice. Segments are now
   disjoint, and `Chunker` merges overlapping input segments.
 - Decoding no longer returns empty or partial audio without an error for
-  chained Ogg streams, or for files where many packets fail to decode. Same-layout chained
-  streams decode fully; a sample rate or channel count change is
-  `Error::Unsupported`.
+  chained Ogg streams, or for files where many packets fail to decode.
+  Same-layout chained streams decode fully; a sample rate or channel count
+  change is `Error::Unsupported`.
 - A panic inside Symphonia on malformed input (found by fuzzing: a
   Matroska element with a zero length byte) is returned as
   `Error::InvalidInput` instead of unwinding into the caller.
@@ -137,8 +139,6 @@ uses [Semantic Versioning](https://semver.org/).
   abort the process (found by fuzzing).
 
 ### Removed
-
-- **Licensing:** the crate is now MIT only (0.1.x was MIT OR Apache-2.0).
 
 - **Breaking:** `buffer::AudioBuffer`, `types::AudioChunk`, the `fixtures`
   feature and `fixtures` module, `Chunker::default()` as an inherent method
@@ -159,5 +159,6 @@ uses [Semantic Versioning](https://semver.org/).
   reduction, and quality checks.
 - Speech-aligned chunking with overlap metadata.
 
-[Unreleased]: https://github.com/dnvt/speech-prep/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/dnvt/speech-prep/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dnvt/speech-prep/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/dnvt/speech-prep/releases/tag/v0.1.4
