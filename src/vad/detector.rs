@@ -42,6 +42,8 @@ pub struct VadDetector {
     metrics: Arc<dyn VadMetricsCollector>,
     energy_weight: f32,
     flux_weight: f32,
+    /// Frames buffered at the start of a stream to estimate the background.
+    warmup_frames: usize,
     state: Mutex<DetectorState>,
 }
 
@@ -90,6 +92,8 @@ impl VadDetector {
         );
 
         let state = DetectorState::new(&config, fft.make_output_vec().len());
+        let hop_secs = config.hop_length_samples()? as f64 / f64::from(config.sample_rate);
+        let warmup_frames = (WARMUP.as_secs_f64() / hop_secs).ceil().max(1.0) as usize;
 
         Ok(Self {
             config,
@@ -98,6 +102,7 @@ impl VadDetector {
             metrics,
             energy_weight,
             flux_weight,
+            warmup_frames,
             state: Mutex::new(state),
         })
     }
@@ -165,12 +170,32 @@ impl VadDetector {
     /// complete analysis frame.
     pub(crate) fn undecided_from(&self) -> usize {
         let state = self.lock_state();
+        if let Some(first) = state.warmup.as_ref().and_then(|w| w.first()) {
+            return first.start_sample;
+        }
         state
             .active_segment
             .as_ref()
             .map_or(state.carry_start, |seg| {
                 seg.start_sample.min(state.carry_start)
             })
+    }
+
+    /// Seed the noise baselines from the warm-up frames.
+    ///
+    /// The quietest frame's energy is used rather than the first frame's, so a
+    /// stream that starts mid-speech still gets a background estimate from
+    /// the dips between syllables. Flux uses the median, skipping frame 0,
+    /// whose flux is measured against an empty spectrum.
+    fn seed_baselines(&self, frames: &[FrameMetrics], state: &mut DetectorState) {
+        if let Some(energy) = frames.iter().map(|f| f.energy).min_by(f32::total_cmp) {
+            state.energy_baseline = energy.max(self.config.energy_floor).max(EPSILON);
+        }
+        let mut flux: Vec<f32> = frames.iter().skip(1).map(|f| f.flux).collect();
+        flux.sort_by(f32::total_cmp);
+        if let Some(&median) = flux.get(flux.len() / 2) {
+            state.flux_baseline = median.max(self.config.flux_floor).max(EPSILON);
+        }
     }
 
     /// First stream sample not yet covered by a complete analysis frame.
@@ -200,19 +225,39 @@ impl VadDetector {
         let chunk_end_sample = detector_state.processed_samples;
 
         let frames = self.frame_signal(samples, finish, &mut detector_state)?;
-
-        let (mut chunks, stats) = if frames.is_empty() {
-            (Vec::new(), VadStats::default())
+        let mut metrics = if frames.is_empty() {
+            Vec::new()
         } else {
             let energy = Self::compute_energy(&frames);
             let flux = self.compute_spectral_flux(&frames, &mut detector_state)?;
-            self.merge_metrics(
-                &frames,
-                &energy,
-                &flux,
-                chunk_end_sample,
-                &mut detector_state,
-            )?
+            frames
+                .iter()
+                .zip(energy)
+                .zip(flux)
+                .map(|((frame, energy), flux)| FrameMetrics {
+                    start_sample: frame.start_sample,
+                    valid_len: frame.valid_len,
+                    energy,
+                    flux,
+                })
+                .collect()
+        };
+
+        // Hold the first frames back until the background level can be
+        // estimated from them.
+        if let Some(warmup) = detector_state.warmup.as_mut() {
+            warmup.append(&mut metrics);
+            if warmup.len() >= self.warmup_frames || finish {
+                metrics = std::mem::take(warmup);
+                detector_state.warmup = None;
+                self.seed_baselines(&metrics, &mut detector_state);
+            }
+        }
+
+        let (mut chunks, stats) = if metrics.is_empty() {
+            (Vec::new(), VadStats::default())
+        } else {
+            self.merge_metrics(&metrics, chunk_end_sample, &mut detector_state)?
         };
 
         if finish {
@@ -381,9 +426,7 @@ impl VadDetector {
 
     fn merge_metrics(
         &self,
-        frames: &[Frame],
-        energy: &[f32],
-        flux: &[f32],
+        frames: &[FrameMetrics],
         chunk_end_sample: usize,
         detector_state: &mut DetectorState,
     ) -> Result<(Vec<SpeechChunk>, VadStats)> {
@@ -415,23 +458,8 @@ impl VadDetector {
             .as_ref()
             .map_or(0usize, |state| state.silence_run);
 
-        for (idx, frame) in frames.iter().enumerate() {
-            let raw_energy = energy.get(idx).copied().ok_or_else(|| {
-                Error::Processing(format!("energy array length mismatch at index {idx}"))
-            })?;
-            let raw_flux = flux.get(idx).copied().ok_or_else(|| {
-                Error::Processing(format!("flux array length mismatch at index {idx}"))
-            })?;
-
-            // Seed the baselines from the start of the stream, assuming it
-            // begins with background. Frame 0 has no previous spectrum, so
-            // its flux is meaningless; seed flux from frame 1.
-            match detector_state.frames_seen {
-                0 => energy_baseline = raw_energy.max(self.config.energy_floor),
-                1 => flux_baseline = raw_flux.max(self.config.flux_floor),
-                _ => {}
-            }
-            detector_state.frames_seen += 1;
+        for frame in frames {
+            let (raw_energy, raw_flux) = (frame.energy, frame.flux);
 
             let energy_denominator = energy_baseline.max(self.config.energy_floor).max(EPSILON);
             let normalized_energy =
@@ -591,6 +619,10 @@ impl VadDetector {
     }
 }
 
+/// Audio buffered at the start of a stream to estimate the background level
+/// before any frame is classified.
+const WARMUP: AudioDuration = AudioDuration::from_millis(300);
+
 /// Per-frame factor for raising a baseline during speech. With the default
 /// 10 ms hop the baseline needs a few seconds of sustained level to rise,
 /// while words and syllables only nudge it.
@@ -637,11 +669,22 @@ struct Frame {
     valid_len: usize,
 }
 
+/// Per-frame measurements fed to the decision logic.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrameMetrics {
+    start_sample: usize,
+    valid_len: usize,
+    energy: f32,
+    flux: f32,
+}
+
 pub(super) struct DetectorState {
     /// Samples received so far.
     pub(super) processed_samples: usize,
-    /// Analysis frames processed so far.
-    pub(super) frames_seen: u64,
+    /// Measurements of the first frames of the stream, held back until
+    /// there are enough to estimate the background level. `None` once the
+    /// baselines have been seeded.
+    pub(super) warmup: Option<Vec<FrameMetrics>>,
     /// Pre-emphasized samples not yet consumed by a complete frame.
     pub(super) carry: Vec<f32>,
     /// Stream index of `carry[0]`.
@@ -669,7 +712,7 @@ impl DetectorState {
     fn new(config: &VadConfig, spectrum_bins: usize) -> Self {
         Self {
             processed_samples: 0,
-            frames_seen: 0,
+            warmup: Some(Vec::new()),
             carry: Vec::new(),
             carry_start: 0,
             last_segment_end: 0,
@@ -893,6 +936,36 @@ mod tests {
                 "{seg:?}"
             );
         }
+    }
+
+    #[test]
+    fn stream_starting_mid_speech_is_detected() {
+        // Voiced harmonics with 10 dB syllable dips at 4 Hz, starting on a
+        // loud peak. Seeding the background from the first frame used to
+        // classify all of it as background.
+        let mut audio: Vec<f32> = (0..SR * 2)
+            .map(|i| {
+                let t = i as f32 / SR as f32;
+                let phase = 2.0 * std::f32::consts::PI * 4.0 * t;
+                let envelope = 0.684f32.mul_add(0.5f32.mul_add(phase.cos(), 0.5), 0.316);
+                let voiced: f32 = (1..=15)
+                    .map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32)
+                    .sum();
+                0.3 * envelope * voiced
+            })
+            .collect();
+        audio.extend(vec![0.0; SR]);
+
+        let detector = VadDetector::new(VadConfig::default()).unwrap();
+        let mut segments = detector.detect(&audio).unwrap();
+        segments.extend(detector.flush().unwrap());
+
+        let speech: f64 = segments
+            .iter()
+            .map(|s| s.end_time.as_secs() - s.start_time.as_secs())
+            .sum();
+        assert!(segments[0].start_time.as_secs() < 0.05, "{segments:?}");
+        assert!(speech > 1.8, "only {speech:.2} s detected: {segments:?}");
     }
 
     #[test]
