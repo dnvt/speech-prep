@@ -6,6 +6,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `NoiseReducer` now carries the previous call's tail as real left-hand
+  context, so a continuous signal split across calls no longer has a
+  discontinuity at the leading edge of each chunk once a noise profile is
+  learned (previously each call zero-padded its own left edge). The trailing
+  edge of a call still lacks future context and is re-covered on the next
+  call; eliminating that residual entirely would require an output-lagging
+  (buffered) API, which is a separate change.
+
 ## [0.2.0] - 2026-10-11
 
 ### Upgrading from 0.1

@@ -174,6 +174,12 @@ pub struct NoiseReducer {
     window: Vec<f32>,
     noise_profile: Vec<f32>,
     noise_initialized: bool,
+    /// Tail of the previous `reduce` call, used as real left-hand context for
+    /// the analysis windows at the start of the next call. Without it each
+    /// call zero-pads its own left edge, so once a noise profile is learned
+    /// the spectral subtraction on those zero-padded frames leaves a
+    /// discontinuity at chunk boundaries. Cleared by [`reset`](Self::reset).
+    history: Vec<f32>,
 }
 
 impl std::fmt::Debug for NoiseReducer {
@@ -215,6 +221,7 @@ impl NoiseReducer {
             config,
             fft_forward,
             fft_inverse,
+            history: Vec::new(),
         })
     }
 
@@ -246,6 +253,14 @@ impl NoiseReducer {
         let mut output = vec![0.0f32; padded_len];
         let mut weight = vec![0.0f32; padded_len];
 
+        // Real left-hand context from the previous call (its last `pad`
+        // samples), so the opening frames analyze actual audio instead of
+        // zeros. The right pad has no future context and stays zero; that
+        // edge is re-covered with real context on the next call. Cloned to a
+        // local (at most one frame) so it does not borrow `self` across the
+        // `&mut self` FFT calls below.
+        let left_ctx = self.history.clone();
+
         let mut frame = vec![0.0f32; frame_length];
         let mut pos = 0;
         while pos + frame_length <= padded_len {
@@ -253,6 +268,15 @@ impl NoiseReducer {
                 let idx = pos + i;
                 *slot = if (pad..pad + samples.len()).contains(&idx) {
                     samples.get(idx - pad).copied().unwrap_or(0.0)
+                } else if idx < pad {
+                    // Left pad: map idx to a sample `pad - idx` before the
+                    // chunk start, taken from the tail of the previous call.
+                    left_ctx
+                        .len()
+                        .checked_sub(pad - idx)
+                        .and_then(|k| left_ctx.get(k))
+                        .copied()
+                        .unwrap_or(0.0)
                 } else {
                     0.0
                 };
@@ -286,6 +310,12 @@ impl NoiseReducer {
             })
             .collect();
 
+        // Keep this call's tail as left-context for the next call.
+        let keep = samples.len().min(pad);
+        self.history = samples
+            .get(samples.len() - keep..)
+            .map_or_else(Vec::new, <[f32]>::to_vec);
+
         Ok(result)
     }
 
@@ -293,6 +323,7 @@ impl NoiseReducer {
     pub fn reset(&mut self) {
         self.noise_profile.fill(INITIAL_NOISE_MAGNITUDE);
         self.noise_initialized = false;
+        self.history.clear();
     }
 
     /// Mean of the noise magnitude spectrum, for diagnostics.
@@ -923,6 +954,56 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err < 1e-3, "max reconstruction error {max_err}");
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_leading_edge_matches_single_call() -> TestResult<()> {
+        // With a learned noise profile, splitting a continuous signal across
+        // two reduce() calls used to leave a discontinuity at the boundary
+        // because the second call zero-padded its left edge. With left-context
+        // carried from the previous call, the second chunk's leading samples
+        // now match a single-call denoise of the whole signal.
+        let noise = generate_sine_wave(60.0, 16000, 0.25, 0.01);
+        let signal = generate_sine_wave(440.0, 16000, 1.0, 0.3);
+        let boundary = 8000;
+
+        let make = || -> TestResult<NoiseReducer> {
+            let mut r =
+                NoiseReducer::new(NoiseReductionConfig::default()).map_err(|e| e.to_string())?;
+            r.reduce(&noise, Some(VadContext { is_silence: true }))
+                .map_err(|e| e.to_string())?;
+            Ok(r)
+        };
+        let speech = Some(VadContext { is_silence: false });
+
+        let mut one = make()?;
+        let single = one.reduce(&signal, speech).map_err(|e| e.to_string())?;
+
+        let mut two = make()?;
+        let mut chunked = two
+            .reduce(signal.get(..boundary).unwrap_or(&signal), speech)
+            .map_err(|e| e.to_string())?;
+        chunked.extend(
+            two.reduce(signal.get(boundary..).unwrap_or(&[]), speech)
+                .map_err(|e| e.to_string())?,
+        );
+
+        // Leading edge of the second chunk (first 64 samples after the
+        // boundary) should match the single-call result closely.
+        let edge = |o: &[f32]| -> f32 {
+            (boundary..boundary + 64)
+                .map(|i| {
+                    (chunked.get(i).copied().unwrap_or(0.0) - o.get(i).copied().unwrap_or(0.0))
+                        .abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        let max_edge = edge(&single);
+        assert!(
+            max_edge < 1e-4,
+            "leading-edge seam {max_edge} (should be ~0)"
+        );
         Ok(())
     }
 }
