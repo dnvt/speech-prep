@@ -6,6 +6,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
+  the sign check and silently turned detection off.
+- `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
+  `dc_bias_alpha`, which previously passed and turned the filter output into
+  `NaN`.
+- A `ChunkerConfig` built as a struct literal with a sub-millisecond
+  `target_duration` no longer divides by zero while estimating the chunk count.
+
 ## [0.2.0] - 2026-10-11
 
 ### Upgrading from 0.1

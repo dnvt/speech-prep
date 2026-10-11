@@ -136,9 +136,11 @@ impl Chunker {
         let noise_baseline =
             Self::compute_noise_baseline(audio, sample_rate, &segments, audio_start);
 
-        let estimated_chunks =
-            (total_duration.as_millis() / self.config.target_duration.as_millis()).max(1) as usize
-                + 1;
+        // Guard the divisor: a struct-literal `ChunkerConfig` can bypass
+        // `ChunkerConfig::new`'s validation with a sub-millisecond
+        // `target_duration`, whose `as_millis()` is 0 and would panic here.
+        let target_ms = self.config.target_duration.as_millis().max(1);
+        let estimated_chunks = (total_duration.as_millis() / target_ms).max(1) as usize + 1;
         let mut chunks = Vec::with_capacity(estimated_chunks);
 
         if segments.is_empty() {
