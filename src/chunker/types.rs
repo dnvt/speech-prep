@@ -42,9 +42,10 @@ pub struct ProcessedChunk {
     pub energy: f32,
 
     /// Estimated SNR in dB: `20 * log10(chunk_rms / noise_rms)`, with the
-    /// noise level taken from the silent parts of the input. `None` when no
-    /// silence was available to estimate it. Measured on the input, before
-    /// any cleanup.
+    /// noise level taken from the silent parts of the input (in a
+    /// [`Pipeline`](crate::Pipeline), the latest silence in the stream).
+    /// `None` when no silence was available to estimate it. Measured on the
+    /// input, before any cleanup.
     pub snr_db: Option<f32>,
 
     /// `true` if any sample reaches `|x| >= 0.999`, which usually means the

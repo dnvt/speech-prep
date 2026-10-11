@@ -95,6 +95,9 @@ pub struct Pipeline {
     max_hold: usize,
     /// Part of the currently open segment has already been emitted.
     continuing_speech: bool,
+    /// RMS of the last silence chunk, for the SNR of speech chunks emitted
+    /// from a window with no silence of its own.
+    noise_rms: Option<f32>,
 }
 
 /// Default for [`Pipeline::with_max_speech_hold`].
@@ -156,6 +159,7 @@ impl Pipeline {
             last_tail: None,
             max_hold: 0,
             continuing_speech: false,
+            noise_rms: None,
         }
         .with_max_speech_hold(DEFAULT_MAX_SPEECH_HOLD);
         // Components may have been used before; the pipeline counts samples
@@ -279,6 +283,7 @@ impl Pipeline {
         self.pending_start = 0;
         self.last_tail = None;
         self.continuing_speech = false;
+        self.noise_rms = None;
     }
 
     /// Emit whole chunks from an open speech segment that has been held
@@ -361,6 +366,19 @@ impl Pipeline {
         if std::mem::take(&mut self.continuing_speech) {
             if let Some(first) = chunks.first_mut().filter(|c| !c.is_silence()) {
                 first.start_boundary = ChunkBoundary::Continuation;
+            }
+        }
+
+        // A window with no silence in it (held speech, or the end of a
+        // stream) gives the chunker nothing to measure noise from; fall back
+        // to the last silence seen. Both levels are measured before cleanup.
+        for chunk in &mut chunks {
+            if chunk.is_silence() {
+                self.noise_rms = Some(chunk.energy).filter(|&rms| rms > 0.0);
+            } else if chunk.snr_db.is_none() {
+                chunk.snr_db = self
+                    .noise_rms
+                    .and_then(|noise| Chunker::calculate_snr_db(chunk.energy, noise));
             }
         }
 
@@ -632,6 +650,30 @@ mod tests {
             .filter(|c| c.start_boundary == ChunkBoundary::SpeechStart)
             .count();
         assert_eq!(starts, 1, "only the first speech chunk starts the segment");
+    }
+
+    #[test]
+    fn held_speech_chunks_get_an_snr() {
+        let mut audio = burst(1.0, 6.0, 0.5);
+        let mut state = 1u32;
+        for s in &mut audio {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s += 0.002 * (state as f32 / u32::MAX as f32 - 0.5);
+        }
+
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = Vec::new();
+        for block in audio.chunks(1_600) {
+            chunks.extend(pipeline.process_samples(block).unwrap().chunks);
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        let speech: Vec<_> = chunks.iter().filter(|c| !c.is_silence()).collect();
+        assert!(speech.len() > 3);
+        for chunk in speech {
+            let snr = chunk.snr_db.unwrap_or_else(|| panic!("no SNR: {chunk:?}"));
+            assert!(snr > 20.0, "{snr}");
+        }
     }
 
     #[test]
