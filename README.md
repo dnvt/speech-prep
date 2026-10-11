@@ -90,7 +90,8 @@ fn main() -> speech_prep::Result<()> {
 | Opus | Ogg, WebM | no: detected, then rejected with `Error::Unsupported` |
 
 Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia). Any
-channel count is averaged to mono.
+channel count is averaged to mono, and sample rates from 4 to 768 kHz are
+accepted.
 
 ## Limitations
 

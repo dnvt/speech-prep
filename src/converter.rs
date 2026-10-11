@@ -16,11 +16,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::decoder::{self, ChannelMixer, SampleRateConverter};
-#[cfg(doc)]
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::AudioFormat;
 use crate::time::AudioInstant;
+
+/// Input sample rates the converter accepts. Rates outside this range only
+/// occur in corrupt or crafted files, and resampling them would need huge
+/// filters (from far above) or huge outputs (from far below).
+pub const SUPPORTED_INPUT_RATES: std::ops::RangeInclusive<u32> = 4_000..=768_000;
 
 /// Sample rate of [`StandardAudio`].
 pub const STANDARD_SAMPLE_RATE: u32 = SampleRateConverter::TARGET_SAMPLE_RATE;
@@ -133,6 +136,14 @@ impl AudioFormatConverter {
 
         let decoded = decoder::decode(audio_bytes, extension)?;
         let format = decoded.format;
+        if !SUPPORTED_INPUT_RATES.contains(&decoded.sample_rate) {
+            return Err(Error::Unsupported(format!(
+                "sample rate {} Hz is outside {}-{} Hz",
+                decoded.sample_rate,
+                SUPPORTED_INPUT_RATES.start(),
+                SUPPORTED_INPUT_RATES.end()
+            )));
+        }
         let peak_before = peak(&decoded.samples);
 
         let mono = ChannelMixer::mix_to_mono(&decoded.samples, decoded.channels)?;
@@ -168,7 +179,6 @@ fn peak(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
 
     fn wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
         let spec = hound::WavSpec {
@@ -238,6 +248,15 @@ mod tests {
     fn rejects_bytes_that_only_look_like_mp3() {
         let result = AudioFormatConverter::convert_to_standard(&[0xFF, 0xFB, 0x90, 0x00]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_implausible_sample_rates() {
+        for rate in [1_000, 1_040_220_288] {
+            let err =
+                AudioFormatConverter::convert_to_standard(&wav(rate, 1, &[0; 16])).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{rate} Hz: {err:?}");
+        }
     }
 
     #[test]

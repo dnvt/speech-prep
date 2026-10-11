@@ -88,6 +88,9 @@ uses [Semantic Versioning](https://semver.org/).
 - A panic inside Symphonia on malformed input (found by fuzzing: a
   Matroska element with a zero length byte) is returned as
   `Error::InvalidInput` instead of unwinding into the caller.
+- Inputs declaring a sample rate outside 4-768 kHz are rejected with
+  `Error::Unsupported`. Fuzzing found a 10 KB file claiming 1.04 GHz that
+  made the resampler build a 1.7 GB filter and run for 40 s.
 - `NoiseReductionConfig::validate` rejects a hop shorter than one sample,
   which made `reduce` loop forever.
 - Symphonia 0.6 fixes an untrusted allocation in the MP4 reader: a 5 KB
