@@ -9,13 +9,18 @@
 //! [`Pipeline`] is stateful. Feed one stream through
 //! [`process_bytes`](Pipeline::process_bytes) or
 //! [`process_samples`](Pipeline::process_samples) in order, then call
-//! [`flush`](Pipeline::flush) to emit whatever is still buffered. Audio that
-//! belongs to a speech segment that has not ended yet is held back until the
-//! segment closes, so a speech chunk is never split across two calls.
+//! [`flush`](Pipeline::flush) to emit whatever is still buffered.
+//!
+//! Audio inside a speech segment that has not ended yet is held back until
+//! the speaker pauses, so chunk edges fall on speech boundaries. To bound
+//! latency, a segment held longer than
+//! [`with_max_speech_hold`](Pipeline::with_max_speech_hold) (2 s by default)
+//! is emitted in whole chunks marked
+//! [`Continuation`](crate::ChunkBoundary::Continuation) at the cut.
 
 use std::time::Duration;
 
-use crate::chunker::{Chunker, ProcessedChunk, apply_overlaps};
+use crate::chunker::{ChunkBoundary, Chunker, ProcessedChunk, apply_overlaps};
 use crate::converter::{AudioFormatConverter, STANDARD_SAMPLE_RATE};
 use crate::error::{Error, Result};
 use crate::preprocessing::{
@@ -86,7 +91,14 @@ pub struct Pipeline {
     /// Tail of the last emitted chunk, used as `overlap_prev` for the next
     /// call's first chunk.
     last_tail: Option<Vec<f32>>,
+    /// Longest stretch of an open speech segment held back, in samples.
+    max_hold: usize,
+    /// Part of the currently open segment has already been emitted.
+    continuing_speech: bool,
 }
+
+/// Default for [`Pipeline::with_max_speech_hold`].
+const DEFAULT_MAX_SPEECH_HOLD: Duration = Duration::from_secs(2);
 
 impl Pipeline {
     /// Create a pipeline with default settings for 16 kHz speech.
@@ -142,11 +154,29 @@ impl Pipeline {
             pending: Vec::new(),
             pending_start: 0,
             last_tail: None,
-        };
+            max_hold: 0,
+            continuing_speech: false,
+        }
+        .with_max_speech_hold(DEFAULT_MAX_SPEECH_HOLD);
         // Components may have been used before; the pipeline counts samples
         // from zero.
         pipeline.reset();
         Ok(pipeline)
+    }
+
+    /// Limit how long audio inside a speech segment that has not ended yet
+    /// is held back. Default: 2 s.
+    ///
+    /// Once more than `hold` is buffered, complete chunks from the open
+    /// segment are emitted right away; the chunk at the cut gets a
+    /// [`ChunkBoundary::Continuation`] edge instead of waiting for the
+    /// speaker to pause. Values shorter than the chunker's `max_duration`
+    /// are raised to it.
+    #[must_use]
+    pub fn with_max_speech_hold(mut self, hold: Duration) -> Self {
+        let hold = hold.max(self.chunker.config().max_duration);
+        self.max_hold = Chunker::duration_to_samples(hold, STANDARD_SAMPLE_RATE);
+        self
     }
 
     /// Decode an encoded audio file or fragment and process it.
@@ -207,11 +237,12 @@ impl Pipeline {
             self.chunker.config().target_duration,
             STANDARD_SAMPLE_RATE,
         );
-        let chunks = if segments.is_empty() && emit_end - self.pending_start < min_silence {
+        let mut chunks = if segments.is_empty() && emit_end - self.pending_start < min_silence {
             Vec::new()
         } else {
             self.emit(&segments, emit_end, &mut latencies)?
         };
+        chunks.extend(self.emit_held_speech(&mut latencies)?);
         latencies.total = start.elapsed();
         Ok(ProcessingResult { chunks, latencies })
     }
@@ -247,6 +278,40 @@ impl Pipeline {
         self.pending.clear();
         self.pending_start = 0;
         self.last_tail = None;
+        self.continuing_speech = false;
+    }
+
+    /// Emit whole chunks from an open speech segment that has been held
+    /// longer than `max_hold`.
+    fn emit_held_speech(&mut self, latencies: &mut StageLatencies) -> Result<Vec<ProcessedChunk>> {
+        let analyzed = self.vad.analyzed_until();
+        if analyzed.saturating_sub(self.pending_start) <= self.max_hold {
+            return Ok(Vec::new());
+        }
+        let Some(seg_start) = self.vad.active_segment_start_sample() else {
+            return Ok(Vec::new());
+        };
+
+        let target = Chunker::duration_to_samples(
+            self.chunker.config().target_duration,
+            STANDARD_SAMPLE_RATE,
+        )
+        .max(1);
+        let speech_from = seg_start.max(self.pending_start);
+        let cut = speech_from + analyzed.saturating_sub(speech_from) / target * target;
+        if cut <= speech_from {
+            return Ok(Vec::new());
+        }
+        let Some(open) = self.vad.open_segment(cut) else {
+            return Ok(Vec::new());
+        };
+
+        let mut chunks = self.emit(&[open], cut, latencies)?;
+        if let Some(last) = chunks.last_mut() {
+            last.end_boundary = ChunkBoundary::Continuation;
+        }
+        self.continuing_speech = true;
+        Ok(chunks)
     }
 
     /// Chunk and clean `pending` up to stream sample `emit_end`.
@@ -288,6 +353,14 @@ impl Pipeline {
             window_start,
         )?;
         latencies.chunking = chunk_start.elapsed();
+
+        // The start of this window continues a segment cut by a previous
+        // forced emission.
+        if std::mem::take(&mut self.continuing_speech) {
+            if let Some(first) = chunks.first_mut().filter(|c| !c.is_silence()) {
+                first.start_boundary = ChunkBoundary::Continuation;
+            }
+        }
 
         let preprocess_start = AudioInstant::now();
         for chunk in &mut chunks {
@@ -515,6 +588,43 @@ mod tests {
 
         let reference = speech_samples(&run_streamed(&audio, audio.len()));
         assert!(speech_samples(&chunks).abs_diff(reference) <= 320);
+    }
+
+    #[test]
+    fn long_speech_is_emitted_while_still_open() {
+        let audio = burst(0.5, 6.0, 0.5);
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = Vec::new();
+        let mut max_buffered = 0;
+        let mut emitted_during_speech = false;
+
+        for (i, block) in audio.chunks(1_600).enumerate() {
+            let new = pipeline.process_samples(block).unwrap().chunks;
+            let now = (i + 1) * 1_600;
+            if now < SR * 6 && new.iter().any(ProcessedChunk::is_speech) {
+                emitted_during_speech = true;
+            }
+            chunks.extend(new);
+            max_buffered = max_buffered.max(pipeline.pending.len());
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        assert!(emitted_during_speech);
+        // Default hold of 2 s, plus at most one chunk and one block of slack.
+        assert!(
+            max_buffered <= 2 * SR + SR / 2 + 1_600,
+            "buffered {max_buffered}"
+        );
+        assert_contiguous(&chunks, audio.len());
+
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(speech_samples(&chunks).abs_diff(reference) <= 320);
+
+        let starts = chunks
+            .iter()
+            .filter(|c| c.start_boundary == ChunkBoundary::SpeechStart)
+            .count();
+        assert_eq!(starts, 1, "only the first speech chunk starts the segment");
     }
 
     #[test]
