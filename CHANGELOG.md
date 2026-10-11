@@ -17,6 +17,8 @@ uses [Semantic Versioning](https://semver.org/).
 - `VadConfig::min_speech_energy` to tune the absolute level below which a
   frame is never speech.
 - `VadDetector::with_metrics` for attaching a metrics collector.
+- `Pipeline::with_max_speech_hold` (default 2 s): long uninterrupted speech
+  is emitted in chunks while it is still going instead of after it ends.
 - `VadDetector::flush` to analyze the last partial frame and close a segment
   that runs to the end of the stream.
 - `Error::Unsupported` for recognized but undecodable formats (Opus).

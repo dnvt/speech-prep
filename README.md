@@ -39,8 +39,10 @@ fn main() -> speech_prep::Result<()> {
 ```
 
 For live audio, call `pipeline.process_samples(&block)` with 16 kHz mono
-`f32` blocks of any size, then `flush()` at the end of the stream. A speech
-segment is held back until it ends, so a chunk is never split across calls.
+`f32` blocks of any size, then `flush()` at the end of the stream. Speech is
+held back until the speaker pauses, or for at most 2 s
+(`with_max_speech_hold`), so chunks line up with speech without unbounded
+delay.
 
 Try it on a file:
 
@@ -99,9 +101,8 @@ channel count is averaged to mono.
   (`activation_margin`, `min_speech_energy`, `hangover_frames`).
 - **Noise reduction** handles steady noise (fans, hum, hiss). It won't
   remove other voices, music, or reverb.
-- **The pipeline** runs at 16 kHz. `process_bytes` decodes the whole input
-  in memory, and audio inside an open speech segment is buffered until the
-  segment ends, so a very long uninterrupted segment means a long delay.
+- **The pipeline** runs at 16 kHz, and `process_bytes` decodes its whole
+  input in memory.
 
 ## Performance
 

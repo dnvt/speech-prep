@@ -173,6 +173,25 @@ impl VadDetector {
             })
     }
 
+    /// First stream sample not yet covered by a complete analysis frame.
+    pub(crate) fn analyzed_until(&self) -> usize {
+        self.lock_state().carry_start
+    }
+
+    /// The open speech segment so far, reported as ending at `end_sample`.
+    pub(crate) fn open_segment(&self, end_sample: usize) -> Option<SpeechChunk> {
+        let state = self.lock_state();
+        let seg = state.active_segment.as_ref()?;
+        let frames = seg.frame_count.max(1) as f32;
+        Some(SpeechChunk {
+            start_time: self.absolute_time_for_sample(seg.start_sample).ok()?,
+            end_time: self.absolute_time_for_sample(end_sample).ok()?,
+            confidence: (seg.score_sum / frames).clamp(0.0, 1.0),
+            avg_energy: seg.energy_sum / frames,
+            frame_count: seg.frame_count,
+        })
+    }
+
     fn run(&self, samples: &[f32], finish: bool) -> Result<Vec<SpeechChunk>> {
         let detection_start = AudioInstant::now();
         let mut detector_state = self.lock_state();
