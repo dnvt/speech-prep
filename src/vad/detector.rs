@@ -44,6 +44,8 @@ pub struct VadDetector {
     flux_weight: f32,
     /// Frames buffered at the start of a stream to estimate the background.
     warmup_frames: usize,
+    /// `speech_padding` in samples.
+    padding_samples: usize,
     state: Mutex<DetectorState>,
 }
 
@@ -94,6 +96,8 @@ impl VadDetector {
         let state = DetectorState::new(&config, fft.make_output_vec().len());
         let hop_secs = config.hop_length_samples()? as f64 / f64::from(config.sample_rate);
         let warmup_frames = (WARMUP.as_secs_f64() / hop_secs).ceil().max(1.0) as usize;
+        let padding_samples =
+            (config.speech_padding.as_secs_f64() * f64::from(config.sample_rate)).round() as usize;
 
         Ok(Self {
             config,
@@ -103,6 +107,7 @@ impl VadDetector {
             energy_weight,
             flux_weight,
             warmup_frames,
+            padding_samples,
             state: Mutex::new(state),
         })
     }
@@ -173,12 +178,18 @@ impl VadDetector {
         if let Some(first) = state.warmup.as_ref().and_then(|w| w.first()) {
             return first.start_sample;
         }
-        state
+        // A segment is reported with leading padding, so audio up to one
+        // padding length before its start (or before the next unanalyzed
+        // frame, where a new segment could begin) is still undecided.
+        let next_start = state
             .active_segment
             .as_ref()
             .map_or(state.carry_start, |seg| {
                 seg.start_sample.min(state.carry_start)
-            })
+            });
+        next_start
+            .saturating_sub(self.padding_samples)
+            .max(state.last_segment_end.min(next_start))
     }
 
     /// Seed the noise baselines from the warm-up frames.
@@ -208,8 +219,13 @@ impl VadDetector {
         let state = self.lock_state();
         let seg = state.active_segment.as_ref()?;
         let frames = seg.frame_count.max(1) as f32;
+        // Same leading padding as a closed segment gets.
+        let start = seg
+            .start_sample
+            .saturating_sub(self.padding_samples)
+            .max(state.last_segment_end);
         Some(SpeechChunk {
-            start_time: self.absolute_time_for_sample(seg.start_sample).ok()?,
+            start_time: self.absolute_time_for_sample(start).ok()?,
             end_time: self.absolute_time_for_sample(end_sample).ok()?,
             confidence: (seg.score_sum / frames).clamp(0.0, 1.0),
             avg_energy: seg.energy_sum / frames,
@@ -262,8 +278,9 @@ impl VadDetector {
 
         if finish {
             if let Some(segment) = detector_state.active_segment.take() {
-                self.finalize_segment(&segment, chunk_end_sample, &mut chunks)?;
-                detector_state.last_segment_end = segment.last_end_sample.min(chunk_end_sample);
+                let prev_end = detector_state.last_segment_end;
+                detector_state.last_segment_end =
+                    self.finalize_segment(&segment, chunk_end_sample, prev_end, &mut chunks)?;
             }
         }
 
@@ -505,24 +522,33 @@ impl VadDetector {
                 let start = frame.start_sample.max(last_segment_end);
                 let segment_state =
                     active_segment.get_or_insert_with(|| ActiveSegmentState::new(start));
-                segment_state.score_sum += combined;
-                segment_state.energy_sum += raw_energy;
-                segment_state.frame_count += 1;
-                segment_state.last_end_sample = frame.start_sample + frame.valid_len.max(1);
+                // Hangover frames keep the segment open but are not speech:
+                // they must not extend its end or count towards its stats.
+                if raw_is_speech {
+                    segment_state.score_sum += combined;
+                    segment_state.energy_sum += raw_energy;
+                    segment_state.frame_count += 1;
+                    segment_state.last_end_sample = frame.start_sample + frame.valid_len.max(1);
+                }
                 segment_state.silence_run = silence_run;
             } else if let Some(segment_state) = active_segment.take() {
-                let finalize_result =
-                    self.finalize_segment(&segment_state, chunk_end_sample, &mut segments);
-                if let Err(err) = finalize_result {
-                    detector_state.active_segment = Some(segment_state);
-                    return Err(err);
+                match self.finalize_segment(
+                    &segment_state,
+                    chunk_end_sample,
+                    last_segment_end,
+                    &mut segments,
+                ) {
+                    Ok(end) => last_segment_end = end,
+                    Err(err) => {
+                        detector_state.active_segment = Some(segment_state);
+                        return Err(err);
+                    }
                 }
-                last_segment_end = segment_state.last_end_sample.min(chunk_end_sample);
                 silence_run = 0;
             }
 
             stats.frames_processed += 1;
-            if is_speech {
+            if raw_is_speech {
                 stats.speech_frames += 1;
             } else {
                 stats.silence_frames += 1;
@@ -571,28 +597,35 @@ impl VadDetector {
         Ok((segments, stats))
     }
 
+    /// Report a closed segment, padded by `speech_padding` on both sides
+    /// without overlapping the previous segment (`prev_end`) or reaching past
+    /// the audio received so far. Returns the end to use as the new
+    /// `prev_end`.
     fn finalize_segment(
         &self,
         segment: &ActiveSegmentState,
         chunk_end_sample: usize,
+        prev_end: usize,
         segments: &mut Vec<SpeechChunk>,
-    ) -> Result<()> {
-        if segment.last_end_sample <= segment.start_sample {
-            return Ok(());
+    ) -> Result<usize> {
+        let unpadded_end = segment.last_end_sample.min(chunk_end_sample);
+        if segment.last_end_sample <= segment.start_sample
+            || segment.frame_count < self.config.min_speech_frames
+        {
+            return Ok(unpadded_end.max(prev_end));
         }
 
-        if segment.frame_count < self.config.min_speech_frames {
-            return Ok(());
-        }
-
-        let clamped_end = segment
-            .last_end_sample
+        let start = segment
+            .start_sample
+            .saturating_sub(self.padding_samples)
+            .max(prev_end);
+        let end = (segment.last_end_sample + self.padding_samples)
             .min(chunk_end_sample.max(segment.start_sample + 1));
-        let start_time = self.absolute_time_for_sample(segment.start_sample)?;
-        let end_time = self.absolute_time_for_sample(clamped_end)?;
+        let start_time = self.absolute_time_for_sample(start)?;
+        let end_time = self.absolute_time_for_sample(end)?;
 
         if end_time <= start_time {
-            return Ok(());
+            return Ok(unpadded_end.max(prev_end));
         }
 
         let confidence = (segment.score_sum / segment.frame_count as f32).clamp(0.0, 1.0);
@@ -610,7 +643,7 @@ impl VadDetector {
             frame_count: segment.frame_count,
         });
 
-        Ok(())
+        Ok(end)
     }
 
     fn absolute_time_for_sample(&self, sample_index: usize) -> Result<AudioTimestamp> {
@@ -798,10 +831,11 @@ mod tests {
         let detector = VadDetector::new(VadConfig::default()).unwrap();
         let segments = detector.detect(&tone_burst(0.5, 1.0)).unwrap();
 
+        // Boundaries include the default 50 ms of padding on each side.
         assert_eq!(segments.len(), 1);
         let seg = segments[0];
-        assert!((seg.start_time.as_secs() - 0.5).abs() < 0.05, "{seg:?}");
-        assert!((seg.end_time.as_secs() - 1.5).abs() < 0.1, "{seg:?}");
+        assert!((seg.start_time.as_secs() - 0.45).abs() < 0.03, "{seg:?}");
+        assert!((seg.end_time.as_secs() - 1.55).abs() < 0.03, "{seg:?}");
     }
 
     #[test]
@@ -930,7 +964,11 @@ mod tests {
 
         assert_eq!(segments.len(), 2, "{segments:?}");
         for (seg, start) in segments.iter().zip([2.0, 4.0]) {
-            assert!((seg.start_time.as_secs() - start).abs() < 0.05, "{seg:?}");
+            // Includes 50 ms of leading padding.
+            assert!(
+                (seg.start_time.as_secs() - (start - 0.05)).abs() < 0.03,
+                "{seg:?}"
+            );
             assert!(
                 (seg.end_time.as_secs() - (start + 0.6)).abs() < 0.1,
                 "{seg:?}"

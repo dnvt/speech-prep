@@ -100,7 +100,7 @@ accepted.
   16 kHz output keeps the speech band but not the top of the spectrum.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
-  (`activation_margin`, `min_speech_energy`, `hangover_frames`).
+  (`hangover_frames`, `speech_padding`, `min_speech_energy`).
 - **Noise reduction** handles steady noise (fans, hum, hiss). It won't
   remove other voices, music, or reverb.
 - **The pipeline** runs at 16 kHz, and `process_bytes` decodes its whole

@@ -17,7 +17,8 @@ pub trait VadMetricsCollector: Send + Sync {
 pub struct VadStats {
     /// Analysis frames processed.
     pub frames_processed: u64,
-    /// Frames classified as speech (including hangover frames).
+    /// Frames whose level marked them as speech. Hangover frames, which only
+    /// keep a segment open, count as silence.
     pub speech_frames: u64,
     /// Frames classified as silence.
     pub silence_frames: u64,
