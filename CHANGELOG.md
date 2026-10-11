@@ -6,42 +6,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
+## [0.2.1] - 2026-10-11
 
-- Resampler response documentation now distinguishes downsampling, lower-rate
-  input filtering, and unfiltered 16 kHz passthrough; the codec support table
-  no longer claims mu-law or A-law decoding in CAF.
-- The noise floor's slow rise during speech now has the same time constant
-  (5 s) at any frame hop. It was a fixed per-frame factor, so with
-  `frame_overlap: 0.75` steady noise under speech was absorbed in half the
-  time, and with no overlap in twice the time. Defaults are unchanged.
-- `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
-  the sign check and silently turned detection off.
-- `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
-  `dc_bias_alpha`, which previously passed and turned the filter output into
-  `NaN`.
-- A `ChunkerConfig` built as a struct literal with a sub-millisecond
-  `target_duration` is now `Error::Configuration` from `Chunker::chunk`
-  instead of a divide-by-zero panic.
-- `NoiseReducer` now carries the last frame of the stream as real left-hand
-  context and keeps its STFT frames on one hop grid across calls, so a
-  continuous signal split across calls (at any sample, in blocks of any size)
-  no longer has a discontinuity at the leading edge of each chunk once a noise
-  profile is learned (previously each call zero-padded its own left edge and
-  restarted its frame grid). The trailing
-  edge of a call still lacks future context and is re-covered on the next
-  call; eliminating that residual entirely would require an output-lagging
-  (buffered) API, which is a separate change.
-- A truncated stream (cut mid-packet) is now rejected with `InvalidInput`
-  instead of returning the partial audio decoded so far as `Ok`.
-- Symphonia 0.6.1 or newer is required so a malformed metadata length cannot
-  trigger an allocation for a payload that is absent from the input.
-- The decoder caps how many samples one decode may buffer (64 Mi interleaved,
-  256 MiB), and how many 16 kHz samples it will resample to, so a
-  decompression bomb — a tiny compressed file declaring hours of audio — is
-  refused instead of allocating gigabytes.
-
-## [0.2.0] - 2026-10-11
+This is the first published release of the 0.2 series.
 
 ### Upgrading from 0.1
 
@@ -203,6 +170,47 @@ needs a wildcard arm. Opus needs `features = ["opus"]` (Rust 1.95).
 - `glob`, `serde_json`, `parking_lot`, and `rand` dependencies; `hound` is
   now dev-only.
 
+
+
+
+### Fixed
+
+- Resampler response documentation now distinguishes downsampling, lower-rate
+  input filtering, and unfiltered 16 kHz passthrough; the codec support table
+  no longer claims mu-law or A-law decoding in CAF.
+- The noise floor's slow rise during speech now has the same time constant
+  (5 s) at any frame hop. It was a fixed per-frame factor, so with
+  `frame_overlap: 0.75` steady noise under speech was absorbed in half the
+  time, and with no overlap in twice the time. Defaults are unchanged.
+- `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
+  the sign check and silently turned detection off.
+- `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
+  `dc_bias_alpha`, which previously passed and turned the filter output into
+  `NaN`.
+- A `ChunkerConfig` built as a struct literal with a sub-millisecond
+  `target_duration` is now `Error::Configuration` from `Chunker::chunk`
+  instead of a divide-by-zero panic.
+- `NoiseReducer` now carries the last frame of the stream as real left-hand
+  context and keeps its STFT frames on one hop grid across calls, so a
+  continuous signal split across calls (at any sample, in blocks of any size)
+  no longer has a discontinuity at the leading edge of each chunk once a noise
+  profile is learned (previously each call zero-padded its own left edge and
+  restarted its frame grid). The trailing
+  edge of a call still lacks future context and is re-covered on the next
+  call; eliminating that residual entirely would require an output-lagging
+  (buffered) API, which is a separate change.
+- A truncated stream (cut mid-packet) is now rejected with `InvalidInput`
+  instead of returning the partial audio decoded so far as `Ok`.
+- Symphonia 0.6.1 or newer is required so a malformed metadata length cannot
+  trigger an allocation for a payload that is absent from the input.
+- The decoder caps how many samples one decode may buffer (64 Mi interleaved,
+  256 MiB), and how many 16 kHz samples it will resample to, so a
+  decompression bomb — a tiny compressed file declaring hours of audio — is
+  refused instead of allocating gigabytes.
+
+
+
+
 ## [0.1.4] - 2026-04-05
 
 - Voice activity detection with energy and spectral-flux signals.
@@ -211,6 +219,6 @@ needs a wildcard arm. Opus needs `features = ["opus"]` (Rust 1.95).
   reduction, and quality checks.
 - Speech-aligned chunking with overlap metadata.
 
-[Unreleased]: https://github.com/dnvt/speech-prep/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/dnvt/speech-prep/compare/v0.1.4...v0.2.0
+[Unreleased]: https://github.com/dnvt/speech-prep/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/dnvt/speech-prep/compare/v0.1.4...v0.2.1
 [0.1.4]: https://github.com/dnvt/speech-prep/releases/tag/v0.1.4
