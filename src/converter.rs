@@ -31,7 +31,8 @@ pub const STANDARD_SAMPLE_RATE: u32 = SampleRateConverter::TARGET_SAMPLE_RATE;
 /// Mono, 16 kHz audio with samples in `[-1.0, 1.0]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StandardAudio {
-    /// Mono samples at [`STANDARD_SAMPLE_RATE`].
+    /// Mono samples at [`STANDARD_SAMPLE_RATE`], always finite and within
+    /// `[-1.0, 1.0]`.
     pub samples: Vec<f32>,
     /// What the input looked like before conversion.
     pub metadata: ConversionMetadata,
@@ -144,10 +145,20 @@ impl AudioFormatConverter {
                 SUPPORTED_INPUT_RATES.end()
             )));
         }
+        if decoded.samples.iter().any(|s| !s.is_finite()) {
+            return Err(Error::InvalidInput(
+                "decoded audio contains NaN or infinite samples".into(),
+            ));
+        }
         let peak_before = peak(&decoded.samples);
 
         let mono = ChannelMixer::mix_to_mono(&decoded.samples, decoded.channels)?;
-        let samples = SampleRateConverter::resample_to_16khz(&mono, decoded.sample_rate)?;
+        let mut samples = SampleRateConverter::resample_to_16khz(&mono, decoded.sample_rate)?;
+        // Float input may exceed full scale, and the resampler can overshoot
+        // slightly on hard edges.
+        for sample in &mut samples {
+            *sample = sample.clamp(-1.0, 1.0);
+        }
 
         let metadata = ConversionMetadata {
             original_format: format,
@@ -248,6 +259,56 @@ mod tests {
     fn rejects_bytes_that_only_look_like_mp3() {
         let result = AudioFormatConverter::convert_to_standard(&[0xFF, 0xFB, 0x90, 0x00]);
         assert!(result.is_err());
+    }
+
+    fn float_wav(samples: &[f32]) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            sample_rate: 16_000,
+            channels: 1,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn output_is_clamped_to_full_scale() {
+        let standard =
+            AudioFormatConverter::convert_to_standard(&float_wav(&[2.0, -3.0, 0.5])).unwrap();
+        assert_eq!(standard.samples, vec![1.0, -1.0, 0.5]);
+        assert_eq!(standard.metadata.peak_before, 3.0);
+        assert_eq!(standard.metadata.peak_after, 1.0);
+    }
+
+    #[test]
+    fn rejects_non_finite_samples() {
+        for bad in [f32::NAN, f32::INFINITY] {
+            let err =
+                AudioFormatConverter::convert_to_standard(&float_wav(&[0.1, bad])).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn resampled_output_stays_in_range() {
+        // A full-scale square wave makes the sinc filter ring past ±1.
+        let square: Vec<i16> = (0..44_100)
+            .map(|i| {
+                if (i / 50) % 2 == 0 {
+                    i16::MAX
+                } else {
+                    i16::MIN
+                }
+            })
+            .collect();
+        let standard = AudioFormatConverter::convert_to_standard(&wav(44_100, 1, &square)).unwrap();
+        assert!(standard.samples.iter().all(|s| (-1.0..=1.0).contains(s)));
     }
 
     #[test]
