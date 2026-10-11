@@ -18,8 +18,8 @@ pub(crate) struct SampleRateConverter;
 const ZERO_CROSSINGS: usize = 24;
 
 /// Sinc cutoff as a fraction of the lower of the two Nyquist frequencies (the
-/// -6 dB point, not the flat passband edge). For 16 kHz output that is 7.2 kHz;
-/// the response is flat to roughly 6.6 kHz.
+/// -6 dB point, not the flat passband edge). Downsampling to 16 kHz that is
+/// 7.2 kHz, flat to roughly 6.6 kHz; upsampling from 8 kHz it is 3.6 kHz.
 const CUTOFF: f64 = 0.9;
 
 /// Kaiser window shape; 8.0 gives roughly 80 dB stopband attenuation.
