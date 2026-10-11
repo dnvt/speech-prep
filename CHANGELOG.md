@@ -12,6 +12,14 @@ uses [Semantic Versioning](https://semver.org/).
   (5 s) at any frame hop. It was a fixed per-frame factor, so with
   `frame_overlap: 0.75` steady noise under speech was absorbed in half the
   time, and with no overlap in twice the time. Defaults are unchanged.
+- `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
+  the sign check and silently turned detection off.
+- `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
+  `dc_bias_alpha`, which previously passed and turned the filter output into
+  `NaN`.
+- A `ChunkerConfig` built as a struct literal with a sub-millisecond
+  `target_duration` is now `Error::Configuration` from `Chunker::chunk`
+  instead of a divide-by-zero panic.
 - A truncated stream (cut mid-packet) is now rejected with `InvalidInput`
   instead of returning the partial audio decoded so far as `Ok`.
 - The decoder caps how many samples one decode may buffer (64 Mi interleaved,
