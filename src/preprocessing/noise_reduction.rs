@@ -615,16 +615,24 @@ mod tests {
             .collect()
     }
 
+    /// Deterministic uniform noise in `[-1, 1)` (xorshift32), so the SNR
+    /// tests give the same result on every run.
+    fn uniform_noise(seed: u32) -> impl FnMut() -> f32 {
+        let mut state = seed.max(1);
+        move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32).mul_add(2.0, -1.0)
+        }
+    }
+
     // Helper: Add white noise to signal
     fn add_white_noise(signal: &[f32], noise_amplitude: f32) -> Vec<f32> {
-        use rand::Rng;
-        let mut rng = rand::rng();
+        let mut noise = uniform_noise(0x9E37_79B9);
         signal
             .iter()
-            .map(|&s| {
-                let noise: f32 = rng.random_range(-noise_amplitude..noise_amplitude);
-                s + noise
-            })
+            .map(|&s| noise_amplitude.mul_add(noise(), s))
             .collect()
     }
     fn add_low_freq_hum(
@@ -650,14 +658,10 @@ mod tests {
     // typical). NOTE: Spectral subtraction works for STATIONARY noise, not
     // speech-like babble.
     fn add_cafe_noise(signal: &[f32], _sample_rate: u32, amplitude: f32) -> Vec<f32> {
-        use rand::Rng;
-        let mut rng = rand::rng();
+        let mut noise = uniform_noise(0x85EB_CA6B);
         signal
             .iter()
-            .map(|&sample| {
-                let noise: f32 = rng.random_range(-1.0..1.0);
-                amplitude.mul_add(noise, sample)
-            })
+            .map(|&s| amplitude.mul_add(noise(), s))
             .collect()
     }
 

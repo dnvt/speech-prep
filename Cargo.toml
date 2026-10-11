@@ -1,7 +1,7 @@
 [package]
 name = "speech-prep"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "Speech audio preprocessing: decoding to 16 kHz mono, voice activity detection, chunking, and noise reduction"
@@ -25,13 +25,11 @@ include = [
 [dependencies]
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 realfft = "3.5"
-parking_lot = "0.12"
 tracing = "0.1"
 thiserror = "2"
 
 [dev-dependencies]
 hound = "3"
-rand = "0.9"
 
 [[bench]]
 name = "throughput"
