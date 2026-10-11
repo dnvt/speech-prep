@@ -35,8 +35,3 @@ cargo +nightly fuzz run pipeline -- -max_total_time=300
 - Add a line to `CHANGELOG.md` under `Unreleased` for user-visible changes.
 - If a substantial part of a change was AI-generated, say so in the pull
   request, and make sure you can explain every line of it.
-
-## License
-
-By contributing, you agree that your contributions are dual-licensed under
-MIT OR Apache-2.0, like the rest of the project.
