@@ -14,7 +14,8 @@ uses [Semantic Versioning](https://semver.org/).
   `dc_bias_alpha`, which previously passed and turned the filter output into
   `NaN`.
 - A `ChunkerConfig` built as a struct literal with a sub-millisecond
-  `target_duration` no longer divides by zero while estimating the chunk count.
+  `target_duration` is now `Error::Configuration` from `Chunker::chunk`
+  instead of a divide-by-zero panic.
 
 ## [0.2.0] - 2026-10-11
 
