@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// Configuration for the audio chunker.
+/// Configuration for [`Chunker`](super::Chunker).
 ///
-/// Controls how audio is segmented into processing chunks.
+/// Build it with a struct literal, a preset ([`streaming`](Self::streaming),
+/// [`batch`](Self::batch)), or [`new`](Self::new), which also validates.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkerConfig {
     /// Target duration for each chunk (default: 500ms).
@@ -15,8 +16,7 @@ pub struct ChunkerConfig {
 
     /// Maximum allowed chunk duration before forced split (default: 600ms).
     ///
-    /// Long speech segments exceeding this duration will be split into
-    /// multiple chunks to maintain streaming latency guarantees.
+    /// Speech segments longer than this are always split.
     pub max_duration: Duration,
 
     /// Tolerance for chunk duration variance (default: 100ms).
@@ -27,15 +27,14 @@ pub struct ChunkerConfig {
 
     /// Minimum chunk duration to emit (default: 100ms).
     ///
-    /// Segments shorter than this are buffered or merged with adjacent chunks
-    /// to avoid inefficient processing of tiny fragments.
+    /// A trailing piece of a split segment shorter than this is merged into
+    /// the previous piece.
     pub min_duration: Duration,
 
     /// Duration of overlap between adjacent chunks (default: 50ms).
     ///
-    /// Preserves acoustic context across chunk boundaries. Must be in range
-    /// 20-80ms. Overlaps are stored in
-    /// `ProcessedChunk::overlap_prev` and `ProcessedChunk::overlap_next`.
+    /// Copied into `ProcessedChunk::overlap_prev` / `overlap_next`.
+    /// [`new`](Self::new) accepts 20-80 ms.
     pub overlap_duration: Duration,
 }
 
@@ -52,11 +51,11 @@ impl Default for ChunkerConfig {
 }
 
 impl ChunkerConfig {
-    /// Create a new chunker configuration with validation.
+    /// Create a validated configuration.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if:
+    /// Returns [`Error::Configuration`] if:
     /// - `target_duration` is zero or exceeds 5 seconds
     /// - `max_duration` is less than `target_duration`
     /// - `min_duration` exceeds `target_duration`
@@ -69,31 +68,31 @@ impl ChunkerConfig {
         overlap_duration: Duration,
     ) -> Result<Self> {
         if target_duration.as_millis() == 0 {
-            return Err(Error::InvalidInput(
+            return Err(Error::Configuration(
                 "target_duration must be greater than zero".into(),
             ));
         }
         if target_duration > Duration::from_secs(5) {
-            return Err(Error::InvalidInput(
+            return Err(Error::Configuration(
                 "target_duration must not exceed 5 seconds".into(),
             ));
         }
 
         if max_duration < target_duration {
-            return Err(Error::InvalidInput(
+            return Err(Error::Configuration(
                 "max_duration must be >= target_duration".into(),
             ));
         }
 
         if min_duration > target_duration {
-            return Err(Error::InvalidInput(
+            return Err(Error::Configuration(
                 "min_duration must be <= target_duration".into(),
             ));
         }
 
         let overlap_ms = overlap_duration.as_millis();
         if !(20..=80).contains(&overlap_ms) {
-            return Err(Error::InvalidInput(format!(
+            return Err(Error::Configuration(format!(
                 "overlap_duration must be 20-80ms, got {overlap_ms}ms"
             )));
         }
@@ -107,8 +106,7 @@ impl ChunkerConfig {
         })
     }
 
-    /// Create a configuration optimized for real-time streaming (smaller
-    /// chunks).
+    /// 250 ms chunks, for lower latency.
     #[must_use]
     pub fn streaming() -> Self {
         Self {
@@ -120,7 +118,7 @@ impl ChunkerConfig {
         }
     }
 
-    /// Create a configuration optimized for batch processing (larger chunks).
+    /// 1 s chunks, for offline processing.
     #[must_use]
     pub fn batch() -> Self {
         Self {

@@ -1,45 +1,38 @@
-//! Voice Activity Detection (VAD) with dual-metric analysis.
+//! Voice activity detection.
 //!
-//! This module provides real-time voice activity detection using a combination
-//! of energy and spectral flux metrics with adaptive baseline tracking.
+//! [`VadDetector`] combines frame energy and spectral flux against adaptive
+//! baselines and returns speech segments as [`SpeechChunk`]s. It keeps state
+//! between calls, so you can feed a stream block by block.
 //!
-//! # Features
-//!
-//! - **Dual-metric analysis**: Energy + spectral flux for robust detection
-//! - **Adaptive thresholding**: Dynamic baseline tracking for varying noise
-//!   conditions
-//! - **Streaming support**: Maintains state across detect() calls for
-//!   continuous audio
-//! - **Configurable sensitivity**: Extensive tuning options via `VadConfig`
-//! - **Metrics instrumentation**: Performance and accuracy tracking via
-//!   `VadMetricsCollector`
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use std::sync::Arc;
-//!
-//! use speech_prep::vad::{NoopVadMetricsCollector, VadConfig, VadDetector};
-//!
-//! let config = VadConfig::default();
-//! let metrics = Arc::new(NoopVadMetricsCollector);
-//! let detector = VadDetector::new(config, metrics)?;
-//!
-//! // Process audio samples
-//! let audio_samples: Vec<f32> = vec![0.0; 16000]; // 1 second at 16kHz
-//! let speech_segments = detector.detect(&audio_samples)?;
-//!
-//! assert!(speech_segments.iter().all(|segment| segment.end_time >= segment.start_time));
-//! # Ok::<(), speech_prep::error::Error>(())
 //! ```
+//! use speech_prep::{VadConfig, VadDetector};
+//!
+//! # fn main() -> speech_prep::Result<()> {
+//! let detector = VadDetector::new(VadConfig::default())?;
+//!
+//! // 1 s of silence, 1 s of a 1 kHz tone, 1 s of silence, at 16 kHz.
+//! let mut audio = vec![0.0f32; 48_000];
+//! for (i, s) in audio[16_000..32_000].iter_mut().enumerate() {
+//!     *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / 16_000.0).sin();
+//! }
+//!
+//! let segments = detector.detect(&audio)?;
+//! assert_eq!(segments.len(), 1);
+//! println!("speech from {} to {}", segments[0].start_time, segments[0].end_time);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! This is a signal-level detector. It does not distinguish speech from other
+//! sounds with similar energy and spectral change, such as music.
 
 pub mod config;
 pub mod detector;
 pub mod metrics;
 
-// Re-export main types for convenient access
 pub use config::VadConfig;
 pub use detector::{SpeechChunk, VadDetector};
 pub use metrics::{
     AdaptiveThresholdSnapshot, NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot,
+    VadStats,
 };

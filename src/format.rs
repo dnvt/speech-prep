@@ -1,50 +1,48 @@
-//! Audio format detection and metadata extraction for the audio pipeline.
+//! Audio container and codec detection.
 //!
-//! This module provides fast, robust format detection using a hybrid approach:
-//! - **Fast path**: Magic-byte detection for common formats such as WAV, FLAC,
-//!   and MP3.
-//! - **Validation path**: Symphonia probe for complex formats such as Opus,
-//!   `WebM`, and M4A.
+//! [`FormatDetector::detect`] checks magic bytes first (WAV, FLAC, MP3,
+//! WebM/Matroska, MP4/M4A) and falls back to a Symphonia probe for anything
+//! else, such as Ogg, where the codec decides the format.
 //!
-//! ## Timing Notes
-//!
-//! Detection should be cheap, but timing depends on input size, container, and
-//! hardware. Measure before publishing latency claims.
-//!
-//! ## Detected Formats
-//!
-//! - **WAV** (RIFF/PCM): Primary format, instant detection
-//! - **FLAC**: Lossless compression, instant detection
-//! - **MP3**: MPEG-1/2 Layer 3, frame sync heuristic
-//! - **Opus**: Ogg container with Opus codec
-//! - **`WebM`**: Matroska container (audio track)
-//! - **M4A/AAC**: MPEG-4 container with AAC codec
+//! Detection does not guarantee decoding: Opus is recognized but has no
+//! decoder in this crate.
 
 use std::io::Cursor;
 
-use crate::error::{Error, Result};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::codecs::{
+    CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_OPUS, CODEC_TYPE_PCM_F32LE,
+    CODEC_TYPE_PCM_F64LE, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S24LE, CODEC_TYPE_PCM_S32LE,
+    CODEC_TYPE_PCM_U8, CODEC_TYPE_VORBIS,
+};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// Audio container and codec format identifier.
+use crate::error::{Error, Result};
+
+/// Detected audio format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AudioFormat {
-    /// RIFF WAV container with PCM encoding.
+    /// RIFF WAV with PCM or IEEE float samples.
     WavPcm,
-    /// Free Lossless Audio Codec.
+    /// FLAC.
     Flac,
-    /// MPEG-1/2 Audio Layer 3.
+    /// MPEG-1/2 Layer III.
     Mp3,
-    /// Opus codec in Ogg container.
+    /// Opus in Ogg. Detected but not decodable.
     Opus,
-    /// `WebM` container (Matroska subset) with audio track.
+    /// Vorbis in Ogg.
+    Vorbis,
+    /// WebM/Matroska. Decodable when the audio codec is supported.
     WebM,
-    /// MPEG-4 container with AAC codec.
+    /// AAC, usually in an MP4/M4A container.
     Aac,
 }
 
 impl AudioFormat {
-    /// Human-readable format name for logging and metrics.
+    /// Short lowercase name, e.g. `"wav"`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -52,21 +50,28 @@ impl AudioFormat {
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
             Self::Opus => "opus",
+            Self::Vorbis => "vorbis",
             Self::WebM => "webm",
             Self::Aac => "aac",
         }
     }
 
-    /// Whether this format is lossless.
+    /// Whether the format stores audio without lossy compression.
     #[must_use]
     pub const fn is_lossless(self) -> bool {
         matches!(self, Self::WavPcm | Self::Flac)
     }
 
-    /// Whether this format requires container parsing (vs raw frames).
-    #[must_use]
-    pub const fn is_container_format(self) -> bool {
-        matches!(self, Self::WavPcm | Self::Opus | Self::WebM | Self::Aac)
+    /// File extension to hint the decoder with.
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::WavPcm => "wav",
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3",
+            Self::Opus | Self::Vorbis => "ogg",
+            Self::WebM => "webm",
+            Self::Aac => "m4a",
+        }
     }
 }
 
@@ -76,23 +81,23 @@ impl std::fmt::Display for AudioFormat {
     }
 }
 
-/// Audio metadata extracted during format detection.
+/// Format plus whatever properties the header exposed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioMetadata {
-    /// Detected container/codec format.
+    /// Detected format.
     pub format: AudioFormat,
-    /// Number of audio channels (if determinable from header).
+    /// Channel count, if known.
     pub channels: Option<u16>,
-    /// Sample rate in Hz (if determinable from header).
+    /// Sample rate in Hz, if known.
     pub sample_rate: Option<u32>,
-    /// Bit depth (if applicable for PCM formats).
+    /// Bits per sample, for PCM-like formats.
     pub bit_depth: Option<u16>,
-    /// Total duration in seconds (if available in container).
+    /// Duration in seconds, if the container records it.
     pub duration_sec: Option<f64>,
 }
 
 impl AudioMetadata {
-    /// Create metadata with only format known (minimal detection).
+    /// Metadata with only the format filled in.
     #[must_use]
     pub const fn format_only(format: AudioFormat) -> Self {
         Self {
@@ -103,51 +108,28 @@ impl AudioMetadata {
             duration_sec: None,
         }
     }
-
-    /// Create metadata with format and basic audio properties.
-    #[must_use]
-    pub const fn with_properties(
-        format: AudioFormat,
-        channels: u16,
-        sample_rate: u32,
-        bit_depth: Option<u16>,
-    ) -> Self {
-        Self {
-            format,
-            channels: Some(channels),
-            sample_rate: Some(sample_rate),
-            bit_depth,
-            duration_sec: None,
-        }
-    }
 }
 
-/// Audio format detector using hybrid magic-byte + Symphonia validation.
+/// Identifies audio formats from raw bytes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FormatDetector;
 
 impl FormatDetector {
-    /// Create a new format detector instance.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// Detect audio format from byte stream using fast magic-byte detection.
+    /// Identify the format, using magic bytes when possible.
     ///
-    /// This is the primary entry point optimized for simple format detection.
-    /// It falls back to Symphonia validation for complex or ambiguous formats.
+    /// Only [`AudioMetadata::format`] is guaranteed to be set. Use
+    /// [`detect_with_metadata`](Self::detect_with_metadata) for channels,
+    /// sample rate, and duration.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if:
-    /// - Payload is too short for any valid audio format
-    /// - Format is unsupported or unrecognized
-    /// - Fallback validation fails for ambiguous formats
+    /// Returns [`Error::InvalidInput`] if `data` is shorter than 4 bytes or is
+    /// not recognizable audio, and [`Error::Unsupported`] for a recognized
+    /// container with an unknown codec.
     pub fn detect(data: &[u8]) -> Result<AudioMetadata> {
         if data.len() < 4 {
             return Err(Error::InvalidInput(
-                "audio payload too short (minimum 4 bytes required)".into(),
+                "audio payload too short (minimum 4 bytes)".into(),
             ));
         }
 
@@ -155,153 +137,102 @@ impl FormatDetector {
             return Ok(AudioMetadata::format_only(format));
         }
 
-        Self::detect_with_symphonia(data)
+        Self::detect_with_metadata(data)
     }
 
-    /// Detect format and extract full metadata using Symphonia probe.
-    ///
-    /// Use when full audio properties are needed (channels, sample rate,
-    /// duration). Measure on target hardware before publishing latency numbers.
+    /// Identify the format by probing the container with Symphonia, and fill
+    /// in channels, sample rate, bit depth, and duration where available.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if format cannot be determined.
+    /// Same as [`detect`](Self::detect).
     pub fn detect_with_metadata(data: &[u8]) -> Result<AudioMetadata> {
-        Self::detect_with_symphonia(data)
+        let source = MediaSourceStream::new(
+            Box::new(Cursor::new(data.to_vec())),
+            MediaSourceStreamOptions::default(),
+        );
+
+        let probed = symphonia::default::get_probe()
+            .format(
+                &Hint::new(),
+                source,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .map_err(|err| {
+                Error::InvalidInput(format!("unrecognized or malformed audio: {err}"))
+            })?;
+
+        let params = &probed
+            .format
+            .default_track()
+            .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?
+            .codec_params;
+
+        let format = match params.codec {
+            CODEC_TYPE_PCM_U8 | CODEC_TYPE_PCM_S16LE | CODEC_TYPE_PCM_S24LE
+            | CODEC_TYPE_PCM_S32LE | CODEC_TYPE_PCM_F32LE | CODEC_TYPE_PCM_F64LE => {
+                AudioFormat::WavPcm
+            }
+            CODEC_TYPE_FLAC => AudioFormat::Flac,
+            CODEC_TYPE_MP3 => AudioFormat::Mp3,
+            CODEC_TYPE_OPUS => AudioFormat::Opus,
+            CODEC_TYPE_VORBIS => AudioFormat::Vorbis,
+            CODEC_TYPE_AAC => AudioFormat::Aac,
+            other => {
+                return Err(Error::Unsupported(format!("codec {other:?}")));
+            }
+        };
+
+        let sample_rate = params.sample_rate;
+        Ok(AudioMetadata {
+            format,
+            channels: params
+                .channels
+                .and_then(|ch| u16::try_from(ch.count()).ok()),
+            sample_rate,
+            bit_depth: params.bits_per_sample.and_then(|b| u16::try_from(b).ok()),
+            duration_sec: params
+                .n_frames
+                .zip(sample_rate)
+                .map(|(frames, rate)| frames as f64 / f64::from(rate)),
+        })
     }
 
-    /// Fast magic-byte detection for common formats.
-    ///
-    /// Returns `Some(AudioFormat)` if format is recognized via magic bytes,
-    /// `None` if validation via Symphonia is needed.
+    /// Recognize formats with fixed signatures. Returns `None` when the
+    /// container must be probed (Ogg, raw AAC, unknown data).
     fn detect_magic_bytes(data: &[u8]) -> Option<AudioFormat> {
-        let len = data.len();
+        let at = |range: std::ops::Range<usize>| data.get(range);
 
-        // WAV: RIFF + size + WAVE
-        if len >= 12 {
-            if let (Some(riff), Some(wave)) = (data.get(0..4), data.get(8..12)) {
-                if riff == b"RIFF" && wave == b"WAVE" {
-                    return Some(AudioFormat::WavPcm);
-                }
+        if at(0..4) == Some(b"RIFF") && at(8..12) == Some(b"WAVE") {
+            return Some(AudioFormat::WavPcm);
+        }
+        if at(0..4) == Some(b"fLaC") {
+            return Some(AudioFormat::Flac);
+        }
+        if at(0..3) == Some(b"ID3") {
+            return Some(AudioFormat::Mp3);
+        }
+        // MPEG audio frame sync with layer bits = Layer III.
+        if let (Some(&b0), Some(&b1)) = (data.first(), data.get(1)) {
+            if b0 == 0xFF && (b1 & 0xE0) == 0xE0 && ((b1 >> 1) & 0x03) == 0x01 {
+                return Some(AudioFormat::Mp3);
             }
         }
-
-        // FLAC
-        if len >= 4 {
-            if let Some(header) = data.get(0..4) {
-                if header == b"fLaC" {
-                    return Some(AudioFormat::Flac);
-                }
-            }
+        if at(0..4) == Some(&[0x1A, 0x45, 0xDF, 0xA3]) {
+            return Some(AudioFormat::WebM);
         }
-
-        // MP3: frame sync heuristic. Use detect_with_metadata for validation.
-        if len >= 2 {
-            if let (Some(&first), Some(&second)) = (data.first(), data.get(1)) {
-                if first == 0xFF && (second & 0xE0) == 0xE0 {
-                    let layer = (second >> 1) & 0x03;
-                    if layer == 0x01 {
-                        return Some(AudioFormat::Mp3);
-                    }
-                }
-            }
-        }
-
-        // Ogg: needs Symphonia to distinguish Opus from Vorbis
-        if len >= 4 {
-            if let Some(header) = data.get(0..4) {
-                if header == b"OggS" {
-                    return None;
-                }
-            }
-        }
-
-        // WebM/Matroska: EBML header
-        if len >= 4 {
-            if let Some(header) = data.get(0..4) {
-                if header == [0x1A, 0x45, 0xDF, 0xA3] {
-                    return Some(AudioFormat::WebM);
-                }
-            }
-        }
-
-        // M4A/AAC: ftyp box
-        if len >= 12 {
-            if let (Some(ftyp), Some(brand)) = (data.get(4..8), data.get(8..12)) {
-                if ftyp == b"ftyp" && (brand == b"M4A " || brand == b"mp42" || brand == b"isom") {
-                    return Some(AudioFormat::Aac);
-                }
+        if at(4..8) == Some(b"ftyp") {
+            let brand = at(8..12);
+            if [b"M4A ", b"M4B ", b"mp42", b"mp41", b"isom"]
+                .iter()
+                .any(|b| brand == Some(&b[..]))
+            {
+                return Some(AudioFormat::Aac);
             }
         }
 
         None
-    }
-
-    /// Detect format using Symphonia's comprehensive probe.
-    ///
-    /// This provides robust format validation and metadata extraction.
-    fn detect_with_symphonia(data: &[u8]) -> Result<AudioMetadata> {
-        let data_vec = data.to_vec();
-        let cursor = Cursor::new(data_vec);
-        let mss = MediaSourceStream::new(
-            Box::new(cursor),
-            symphonia::core::io::MediaSourceStreamOptions::default(),
-        );
-
-        let hint = Hint::new();
-        let probe_result = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &symphonia::core::formats::FormatOptions::default(),
-                &symphonia::core::meta::MetadataOptions::default(),
-            )
-            .map_err(|err| {
-                Error::InvalidInput(format!("unsupported or malformed audio format: {err}"))
-            })?;
-
-        let format_reader = probe_result.format;
-        let codec_params = &format_reader
-            .default_track()
-            .ok_or_else(|| Error::InvalidInput("no audio track found in container".into()))?
-            .codec_params;
-
-        let format = match codec_params.codec {
-            symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
-            | symphonia::core::codecs::CODEC_TYPE_PCM_S24LE
-            | symphonia::core::codecs::CODEC_TYPE_PCM_S32LE
-            | symphonia::core::codecs::CODEC_TYPE_PCM_F32LE => AudioFormat::WavPcm,
-            symphonia::core::codecs::CODEC_TYPE_FLAC => AudioFormat::Flac,
-            symphonia::core::codecs::CODEC_TYPE_MP3 => AudioFormat::Mp3,
-            symphonia::core::codecs::CODEC_TYPE_OPUS => AudioFormat::Opus,
-            symphonia::core::codecs::CODEC_TYPE_VORBIS => {
-                return Err(Error::InvalidInput(
-                    "Vorbis codec not supported (use Opus instead)".into(),
-                ));
-            }
-            symphonia::core::codecs::CODEC_TYPE_AAC => AudioFormat::Aac,
-            _ => {
-                return Err(Error::InvalidInput(format!(
-                    "unsupported codec: {:?}",
-                    codec_params.codec
-                )));
-            }
-        };
-
-        let channels = codec_params.channels.map(|ch| ch.count() as u16);
-        let sample_rate = codec_params.sample_rate;
-        let bit_depth = codec_params.bits_per_sample.map(|b| b as u16);
-        let duration_sec = codec_params
-            .n_frames
-            .and_then(|frames| sample_rate.map(|rate| frames as f64 / f64::from(rate)));
-
-        Ok(AudioMetadata {
-            format,
-            channels,
-            sample_rate,
-            bit_depth,
-            duration_sec,
-        })
     }
 }
 
@@ -311,11 +242,7 @@ mod tests {
 
     type TestResult<T> = std::result::Result<T, String>;
 
-    fn create_detector() -> FormatDetector {
-        FormatDetector::new()
-    }
-
-    fn detect_format(_detector: FormatDetector, data: &[u8]) -> TestResult<AudioMetadata> {
+    fn detect_format(data: &[u8]) -> TestResult<AudioMetadata> {
         FormatDetector::detect(data).map_err(|e| e.to_string())
     }
 
@@ -369,8 +296,7 @@ mod tests {
     // Positive path tests
     #[test]
     fn test_detect_wav_format() -> TestResult<()> {
-        let detector = create_detector();
-        let metadata = detect_format(detector, &wav_header())?;
+        let metadata = detect_format(&wav_header())?;
         assert_eq!(metadata.format, AudioFormat::WavPcm);
         assert_eq!(metadata.format.as_str(), "wav");
         assert!(metadata.format.is_lossless());
@@ -379,8 +305,7 @@ mod tests {
 
     #[test]
     fn test_detect_flac_format() -> TestResult<()> {
-        let detector = create_detector();
-        let metadata = detect_format(detector, &flac_header())?;
+        let metadata = detect_format(&flac_header())?;
         assert_eq!(metadata.format, AudioFormat::Flac);
         assert_eq!(metadata.format.as_str(), "flac");
         assert!(metadata.format.is_lossless());
@@ -389,8 +314,7 @@ mod tests {
 
     #[test]
     fn test_detect_mp3_format() -> TestResult<()> {
-        let detector = create_detector();
-        let metadata = detect_format(detector, &mp3_header())?;
+        let metadata = detect_format(&mp3_header())?;
         assert_eq!(metadata.format, AudioFormat::Mp3);
         assert_eq!(metadata.format.as_str(), "mp3");
         assert!(!metadata.format.is_lossless());
@@ -399,8 +323,7 @@ mod tests {
 
     #[test]
     fn test_detect_webm_format() -> TestResult<()> {
-        let detector = create_detector();
-        let metadata = detect_format(detector, &webm_header())?;
+        let metadata = detect_format(&webm_header())?;
         assert_eq!(metadata.format, AudioFormat::WebM);
         assert_eq!(metadata.format.as_str(), "webm");
         Ok(())
@@ -408,8 +331,7 @@ mod tests {
 
     #[test]
     fn test_detect_aac_format() -> TestResult<()> {
-        let detector = create_detector();
-        let metadata = detect_format(detector, &aac_header())?;
+        let metadata = detect_format(&aac_header())?;
         assert_eq!(metadata.format, AudioFormat::Aac);
         assert_eq!(metadata.format.as_str(), "aac");
         assert!(!metadata.format.is_lossless());
@@ -456,19 +378,17 @@ mod tests {
     // Edge case tests
     #[test]
     fn test_handle_exact_minimum_length() -> TestResult<()> {
-        let detector = create_detector();
         let flac_minimal = b"fLaC".to_vec(); // Exactly 4 bytes
-        let metadata = detect_format(detector, &flac_minimal)?;
+        let metadata = detect_format(&flac_minimal)?;
         assert_eq!(metadata.format, AudioFormat::Flac);
         Ok(())
     }
 
     #[test]
     fn test_handle_large_payload_prefix() -> TestResult<()> {
-        let detector = create_detector();
         let mut large_payload = wav_header();
         large_payload.extend(vec![0u8; 1024 * 1024]); // 1MB of silence
-        let metadata = detect_format(detector, &large_payload)?;
+        let metadata = detect_format(&large_payload)?;
         assert_eq!(metadata.format, AudioFormat::WavPcm);
         Ok(())
     }
@@ -481,6 +401,7 @@ mod tests {
             AudioFormat::Flac,
             AudioFormat::Mp3,
             AudioFormat::Opus,
+            AudioFormat::Vorbis,
             AudioFormat::WebM,
             AudioFormat::Aac,
         ];
@@ -499,32 +420,12 @@ mod tests {
     }
 
     #[test]
-    fn test_container_formats_identified() {
-        assert!(AudioFormat::WavPcm.is_container_format());
-        assert!(AudioFormat::Opus.is_container_format());
-        assert!(AudioFormat::WebM.is_container_format());
-        assert!(AudioFormat::Aac.is_container_format());
-        assert!(!AudioFormat::Flac.is_container_format());
-        assert!(!AudioFormat::Mp3.is_container_format());
-    }
-
-    #[test]
     fn test_metadata_format_only_constructor() {
         let metadata = AudioMetadata::format_only(AudioFormat::Mp3);
         assert_eq!(metadata.format, AudioFormat::Mp3);
         assert_eq!(metadata.channels, None);
         assert_eq!(metadata.sample_rate, None);
         assert_eq!(metadata.bit_depth, None);
-        assert_eq!(metadata.duration_sec, None);
-    }
-
-    #[test]
-    fn test_metadata_with_properties_constructor() {
-        let metadata = AudioMetadata::with_properties(AudioFormat::WavPcm, 2, 44100, Some(16));
-        assert_eq!(metadata.format, AudioFormat::WavPcm);
-        assert_eq!(metadata.channels, Some(2));
-        assert_eq!(metadata.sample_rate, Some(44100));
-        assert_eq!(metadata.bit_depth, Some(16));
         assert_eq!(metadata.duration_sec, None);
     }
 }
