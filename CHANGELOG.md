@@ -8,6 +8,10 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The noise floor's slow rise during speech now has the same time constant
+  (5 s) at any frame hop. It was a fixed per-frame factor, so with
+  `frame_overlap: 0.75` steady noise under speech was absorbed in half the
+  time, and with no overlap in twice the time. Defaults are unchanged.
 - `VadConfig::validate` rejects an infinite `min_speech_energy`, which passed
   the sign check and silently turned detection off.
 - `PreprocessingConfig::validate` rejects a non-finite high-pass cutoff or
