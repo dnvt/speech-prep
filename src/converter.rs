@@ -4,14 +4,17 @@
 //! bytes ─► detect format ─► decode (Symphonia) ─► mix to mono ─► resample to 16 kHz
 //! ```
 //!
-//! Supported inputs: PCM (any bit depth, float, mu-law, A-law) and ADPCM in
-//! WAV, AIFF, or CAF; FLAC; ALAC; MP3; AAC-LC in MP4/M4A; Vorbis in Ogg or
+//! Supported inputs: PCM (any bit depth or float) and ADPCM in WAV, AIFF, or
+//! CAF; mu-law and A-law in WAV or AIFF (not CAF); FLAC; ALAC; MP3; AAC-LC in MP4/M4A; Vorbis in Ogg or
 //! WebM; and, with the `opus` feature, Opus in Ogg or WebM. Without the
 //! feature, Opus input is rejected with [`Error::Unsupported`].
 //!
 //! Any channel count is accepted and averaged to mono. Resampling uses a
-//! windowed-sinc filter that passes up to 7.2 kHz and removes content above
-//! 8 kHz instead of letting it alias.
+//! windowed-sinc filter. For inputs above 16 kHz it is flat to about
+//! 6.6 kHz and rolls off above it (-6 dB near 7.2 kHz), strongly attenuating
+//! content near and above the 8 kHz output Nyquist instead of letting it alias.
+//! Inputs already at 16 kHz pass through without filtering. Lower-rate inputs
+//! are band-limited at 90% of their own Nyquist frequency.
 
 use std::path::Path;
 use std::time::Duration;

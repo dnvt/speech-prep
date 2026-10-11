@@ -8,6 +8,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Resampler response documentation now distinguishes downsampling, lower-rate
+  input filtering, and unfiltered 16 kHz passthrough; the codec support table
+  no longer claims mu-law or A-law decoding in CAF.
 - The noise floor's slow rise during speech now has the same time constant
   (5 s) at any frame hop. It was a fixed per-frame factor, so with
   `frame_overlap: 0.75` steady noise under speech was absorbed in half the
