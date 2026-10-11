@@ -33,8 +33,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      # No rust-cache: releases are rare, and its cleanup trips over the
+      # target/package directory that `cargo publish --dry-run` leaves.
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
 
       - name: Check version, tag, and crates.io
         id: version
