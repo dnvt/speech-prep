@@ -22,7 +22,8 @@ uses [Semantic Versioning](https://semver.org/).
 - `VadDetector::flush` to analyze the last partial frame and close a segment
   that runs to the end of the stream.
 - `Error::Unsupported` for recognized but undecodable formats (Opus).
-- `cargo bench --bench throughput` and a `process_file` example.
+- `cargo bench --bench throughput`, a `process_file` example, and
+  `cargo fuzz` targets for decoding and the pipeline.
 
 ### Changed
 
@@ -71,6 +72,9 @@ uses [Semantic Versioning](https://semver.org/).
   chained Ogg streams, or for files where many packets fail to decode. Same-layout chained
   streams decode fully; a sample rate or channel count change is
   `Error::Unsupported`.
+- A panic inside Symphonia on malformed input (found by fuzzing: a
+  Matroska element with a zero length byte) is returned as
+  `Error::InvalidInput` instead of unwinding into the caller.
 - `NoiseReductionConfig::validate` rejects a hop shorter than one sample,
   which made `reduce` loop forever.
 - `FormatDetector::detect_with_metadata` picks the same track as the

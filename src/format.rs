@@ -146,6 +146,10 @@ impl FormatDetector {
     ///
     /// Same as [`detect`](Self::detect).
     pub fn detect_with_metadata(data: &[u8]) -> Result<AudioMetadata> {
+        crate::decoder::catch_decoder_panic(|| Self::probe_metadata(data))
+    }
+
+    fn probe_metadata(data: &[u8]) -> Result<AudioMetadata> {
         let source = MediaSourceStream::new(
             Box::new(Cursor::new(data.to_vec())),
             MediaSourceStreamOptions::default(),
