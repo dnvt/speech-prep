@@ -47,8 +47,12 @@ uses [Semantic Versioning](https://semver.org/).
   value, like `NoiseReducer::reduce`.
 - **Breaking:** configuration validation errors are `Error::Configuration`
   everywhere; `Error` is `#[non_exhaustive]`.
-- The default VAD energy gate is 10x lower (0.002 instead of 0.02). The old
-  value ignored voiced audio peaking at -20 dBFS.
+- The VAD noise baselines are seeded from the first frames and track the
+  noise floor during speech too. Before, a recording that started with
+  noise above the energy gate was classified as one long speech segment.
+- With that fixed, the default VAD energy gate is 40x lower (0.0005 instead
+  of 0.02). The old value missed 60% of speech peaking at -6 dBFS and all
+  speech at -20 dBFS in a synthesized test set.
 - Channels are mixed to mono before resampling instead of after.
 - Resampling uses a Kaiser-windowed sinc filter instead of linear
   interpolation. A 12 kHz tone at 48 kHz used to alias to 4 kHz at full
