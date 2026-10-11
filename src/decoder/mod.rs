@@ -152,11 +152,7 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
         // Guard against a decompression bomb: a tiny compressed file can
         // declare hours of audio and decode to gigabytes. Check incrementally
         // so the allocation is bounded, not only after the whole decode.
-        if samples.len() > MAX_DECODED_SAMPLES {
-            return Err(Error::InvalidInput(format!(
-                "decoded audio exceeds the {MAX_DECODED_SAMPLES} interleaved-sample limit"
-            )));
-        }
+        check_decoded_size(samples.len(), spec.channels().count(), spec.rate())?;
     }
 
     // Tolerate the odd corrupt frame, but not a stream that mostly fails.
@@ -194,8 +190,26 @@ const MAX_SKIPPED_DENOMINATOR: usize = 10;
 /// against decompression bombs (a tiny compressed file declaring hours of
 /// audio). 64 Mi f32 samples is 256 MiB: about 66 minutes of 16 kHz mono or
 /// 11 minutes of 48 kHz stereo, well beyond any real speech clip while
-/// refusing multi-gigabyte blow-ups. Longer material should be chunked.
+/// refusing multi-gigabyte blow-ups. Longer material should be chunked. The
+/// same bound applies to the projected 16 kHz mono output.
 const MAX_DECODED_SAMPLES: usize = 64 * 1024 * 1024;
+
+/// Reject a decode once it outgrows [`MAX_DECODED_SAMPLES`], either as
+/// buffered interleaved samples or as the 16 kHz mono output it will resample
+/// to. The second bound matters for low input rates: 64 Mi samples of 4 kHz
+/// audio would resample to 256 Mi.
+fn check_decoded_size(interleaved: usize, channels: usize, rate: u32) -> Result<()> {
+    let frames = (interleaved / channels.max(1)) as u64;
+    let resampled = frames
+        .saturating_mul(u64::from(SampleRateConverter::TARGET_SAMPLE_RATE))
+        .div_ceil(u64::from(rate.max(1)));
+    if interleaved > MAX_DECODED_SAMPLES || resampled > MAX_DECODED_SAMPLES as u64 {
+        return Err(Error::InvalidInput(format!(
+            "decoded audio exceeds the {MAX_DECODED_SAMPLES}-sample limit"
+        )));
+    }
+    Ok(())
+}
 
 /// The first track with audio codec parameters.
 pub(crate) fn first_audio_track(reader: &dyn FormatReader) -> Option<(u32, &AudioCodecParameters)> {
@@ -282,6 +296,17 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn decoded_size_cap_counts_the_resampled_output() {
+        // Under the interleaved cap, but 4 kHz mono resamples 4x to 16 kHz.
+        let quarter = MAX_DECODED_SAMPLES / 4;
+        assert!(check_decoded_size(quarter, 1, 4_000).is_ok());
+        assert!(check_decoded_size(quarter + 1, 1, 4_000).is_err());
+        // 48 kHz stereo shrinks when resampled, so the interleaved cap binds.
+        assert!(check_decoded_size(MAX_DECODED_SAMPLES, 2, 48_000).is_ok());
+        assert!(check_decoded_size(MAX_DECODED_SAMPLES + 2, 2, 48_000).is_err());
+    }
 
     fn wav<S: hound::Sample + Copy>(spec: hound::WavSpec, samples: &[S]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());

@@ -11,8 +11,9 @@ uses [Semantic Versioning](https://semver.org/).
 - A truncated stream (cut mid-packet) is now rejected with `InvalidInput`
   instead of returning the partial audio decoded so far as `Ok`.
 - The decoder caps how many samples one decode may buffer (64 Mi interleaved,
-  256 MiB), so a decompression bomb — a tiny compressed file declaring hours
-  of audio — is refused instead of allocating gigabytes.
+  256 MiB), and how many 16 kHz samples it will resample to, so a
+  decompression bomb — a tiny compressed file declaring hours of audio — is
+  refused instead of allocating gigabytes.
 
 ## [0.2.0] - 2026-10-11
 
