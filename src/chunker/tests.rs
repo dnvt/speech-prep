@@ -286,19 +286,8 @@ fn test_overlap_metadata_matches_actual_samples() {
         .expect("chunking failed");
     assert_eq!(chunks.len(), 2, "Should produce two short chunks");
 
-    let first_overlap = chunks[0]
-        .overlap_next
-        .as_ref()
-        .expect("first chunk should expose overlap");
-    assert_eq!(
-        first_overlap.len(),
-        320,
-        "First chunk overlap should match chunk length"
-    );
-    assert_eq!(
-        chunks[0].overlap_ms, 20,
-        "Overlap metadata should reflect actual samples"
-    );
+    assert!(chunks[0].overlap_prev.is_none());
+    assert_eq!(chunks[0].overlap_ms, 0);
 
     let second_overlap = chunks[1]
         .overlap_prev
@@ -328,7 +317,6 @@ fn test_chunk_duration_calculation() {
         snr_db: None,
         has_clipping: false,
         overlap_prev: None,
-        overlap_next: None,
         overlap_ms: 0,
     };
 
@@ -349,7 +337,6 @@ fn test_is_speech_threshold() {
         snr_db: None,
         has_clipping: false,
         overlap_prev: None,
-        overlap_next: None,
         overlap_ms: 0,
     };
 
@@ -391,29 +378,21 @@ fn test_overlap_generation_two_chunks() {
     // Should produce 2 chunks (500ms each from 1s audio)
     assert_eq!(chunks.len(), 2);
 
-    // First chunk: no overlap_prev, has overlap_next
+    // First chunk has no previous chunk.
     assert!(chunks[0].overlap_prev.is_none());
-    assert!(chunks[0].overlap_next.is_some());
-    let overlap_next = chunks[0]
-        .overlap_next
-        .as_ref()
-        .expect("overlap_next should exist");
-    // 50ms @ 16kHz = 800 samples
-    assert_eq!(overlap_next.len(), 800);
-    assert_eq!(chunks[0].overlap_ms, 50);
+    assert_eq!(chunks[0].overlap_ms, 0);
 
-    // Second chunk: has overlap_prev, no overlap_next (last chunk)
-    assert!(chunks[1].overlap_prev.is_some());
-    assert!(chunks[1].overlap_next.is_none());
+    // Second chunk carries the last 50 ms (800 samples) of the first.
     let overlap_prev = chunks[1]
         .overlap_prev
         .as_ref()
         .expect("overlap_prev should exist");
     assert_eq!(overlap_prev.len(), 800);
     assert_eq!(chunks[1].overlap_ms, 50);
-
-    // Verify overlap_prev of chunk[1] matches overlap_next of chunk[0]
-    assert_eq!(overlap_prev, overlap_next);
+    assert_eq!(
+        overlap_prev[..],
+        chunks[0].samples[chunks[0].samples.len() - 800..]
+    );
 }
 
 #[test]
@@ -435,8 +414,7 @@ fn test_overlap_generation_single_chunk() {
     // Single chunk has no overlaps
     assert_eq!(chunks.len(), 1);
     assert!(chunks[0].overlap_prev.is_none());
-    assert!(chunks[0].overlap_next.is_none());
-    assert_eq!(chunks[0].overlap_ms, 0); // No overlap data recorded
+    assert_eq!(chunks[0].overlap_ms, 0);
 }
 
 #[test]
@@ -458,17 +436,10 @@ fn test_overlap_streaming_config() {
     // Streaming config should produce ~4 chunks (250ms each from 1s)
     assert!(chunks.len() >= 3);
 
-    // All chunks should have overlap metadata
-    for chunk in &chunks {
+    // Every chunk after the first carries 50 ms of context.
+    for chunk in chunks.iter().skip(1) {
+        assert!(chunk.overlap_prev.is_some());
         assert_eq!(chunk.overlap_ms, 50);
-    }
-
-    // Intermediate chunks should have both overlaps
-    if chunks.len() > 2 {
-        for chunk in chunks.iter().take(chunks.len() - 1).skip(1) {
-            assert!(chunk.overlap_prev.is_some());
-            assert!(chunk.overlap_next.is_some());
-        }
     }
 }
 
@@ -500,19 +471,15 @@ fn test_overlap_with_silence_gaps() {
     // Should have 3 chunks: speech1 + silence + speech2
     assert_eq!(chunks.len(), 3);
 
-    // speech1 → silence: overlap exists
-    assert!(chunks[0].overlap_next.is_some());
+    // Context crosses speech/silence boundaries too.
     assert!(chunks[1].overlap_prev.is_some());
-
-    // silence → speech2: overlap exists
-    assert!(chunks[1].overlap_next.is_some());
     assert!(chunks[2].overlap_prev.is_some());
 }
 
 #[test]
-fn test_total_samples_with_overlap() {
+fn test_samples_with_context() {
     let chunk = ProcessedChunk {
-        samples: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        samples: vec![1.0, 2.0, 3.0],
         start_boundary: ChunkBoundary::SpeechStart,
         end_boundary: ChunkBoundary::Continuation,
         start_time: AudioTimestamp::EPOCH,
@@ -522,14 +489,10 @@ fn test_total_samples_with_overlap() {
         snr_db: None,
         has_clipping: false,
         overlap_prev: Some(vec![0.5]),
-        overlap_next: Some(vec![5.0]),
         overlap_ms: 10,
     };
 
-    // total_samples_with_overlap calculates total including overlaps
-    let total = chunk.total_samples_with_overlap();
-    // Core: 5 samples, overlaps contain 1 sample each (explicit vectors)
-    assert_eq!(total, 7);
+    assert_eq!(chunk.samples_with_context(), vec![0.5, 1.0, 2.0, 3.0]);
 }
 
 #[test]

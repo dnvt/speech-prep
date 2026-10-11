@@ -37,7 +37,6 @@ impl Chunker {
             snr_db: None,
             has_clipping,
             overlap_prev: None,
-            overlap_next: None,
             overlap_ms: 0,
         })
     }
@@ -88,7 +87,6 @@ impl Chunker {
                 snr_db,
                 has_clipping,
                 overlap_prev: None,
-                overlap_next: None,
                 overlap_ms: 0,
             }]);
         }
@@ -151,7 +149,6 @@ impl Chunker {
                 snr_db,
                 has_clipping,
                 overlap_prev: None,
-                overlap_next: None,
                 overlap_ms: 0,
             });
 

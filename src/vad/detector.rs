@@ -1,49 +1,36 @@
-//! Core VAD detection engine with dual-metric analysis.
+//! Energy-based speech detection against a tracked noise floor.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::error::{Error, Result};
 use crate::time::{AudioDuration, AudioInstant, AudioTimestamp};
-use realfft::{RealFftPlanner, RealToComplex};
 
 use super::config::VadConfig;
-use super::metrics::{
-    AdaptiveThresholdSnapshot, NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot,
-    VadStats,
-};
+use super::metrics::{NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot, VadStats};
 
 /// Number of nanoseconds in one second, used for time conversion.
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
-/// Small epsilon value for numerical stability in floating-point comparisons.
-const EPSILON: f32 = 1e-12;
 
-/// Maximum smoothing factor for baseline tracking (energy, flux, threshold).
-/// Capped at 0.999 to prevent numerical instability from exponential moving
-/// average converging too slowly. At 0.999, half-life ≈ 693 samples (43ms at
-/// 16kHz).
-const MAX_SMOOTHING_FACTOR: f32 = 0.999;
+/// Audio buffered at the start of a stream to estimate the background level
+/// before any frame is classified.
+const WARMUP: AudioDuration = AudioDuration::from_millis(300);
 
-/// Maximum normalized value for energy and spectral flux metrics.
-/// Caps outliers at 10x the baseline to prevent extreme transients from
-/// dominating the detection logic while still allowing headroom for loud
-/// signals.
-const MAX_NORMALIZED_METRIC: f32 = 10.0;
-
-/// Relative energy ratio below which we consider a frame near-silence.
-const SILENCE_RELATIVE_GATE: f32 = 1.7;
+/// Per-frame factor for raising the noise floor during speech. With the
+/// default 10 ms hop the floor needs a few seconds of sustained level to
+/// rise, while words and syllables only nudge it.
+const SPEECH_FLOOR_RISE: f32 = 0.998;
 
 /// Streaming voice activity detector. See the [module docs](super) for an
 /// example and [`VadConfig`] for tuning.
 pub struct VadDetector {
     config: VadConfig,
-    fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
     metrics: Arc<dyn VadMetricsCollector>,
-    energy_weight: f32,
-    flux_weight: f32,
     /// Frames buffered at the start of a stream to estimate the background.
     warmup_frames: usize,
+    /// `speech_padding` in samples.
+    padding_samples: usize,
     state: Mutex<DetectorState>,
 }
 
@@ -52,9 +39,6 @@ impl fmt::Debug for VadDetector {
         let processed_samples = self.lock_state().processed_samples;
         f.debug_struct("VadDetector")
             .field("config", &self.config)
-            .field("window_length", &self.window.len())
-            .field("energy_weight", &self.energy_weight)
-            .field("flux_weight", &self.flux_weight)
             .field("processed_samples", &processed_samples)
             .finish_non_exhaustive()
     }
@@ -79,31 +63,19 @@ impl VadDetector {
     pub fn with_metrics(config: VadConfig, metrics: Arc<dyn VadMetricsCollector>) -> Result<Self> {
         config.validate()?;
 
-        let frame_length = config.frame_length_samples()?;
-        let window = hann_window(frame_length);
-
-        let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(config.fft_size()?);
-
-        let total_weight = config.energy_weight + config.flux_weight;
-        let (energy_weight, flux_weight) = (
-            config.energy_weight / total_weight,
-            config.flux_weight / total_weight,
-        );
-
-        let state = DetectorState::new(&config, fft.make_output_vec().len());
+        let window = hann_window(config.frame_length_samples()?);
         let hop_secs = config.hop_length_samples()? as f64 / f64::from(config.sample_rate);
         let warmup_frames = (WARMUP.as_secs_f64() / hop_secs).ceil().max(1.0) as usize;
+        let padding_samples =
+            (config.speech_padding.as_secs_f64() * f64::from(config.sample_rate)).round() as usize;
 
         Ok(Self {
+            state: Mutex::new(DetectorState::new(&config)),
             config,
-            fft,
             window,
             metrics,
-            energy_weight,
-            flux_weight,
             warmup_frames,
-            state: Mutex::new(state),
+            padding_samples,
         })
     }
 
@@ -131,12 +103,11 @@ impl VadDetector {
             .map(|segment| segment.start_sample)
     }
 
-    /// Clear all streaming state, including the adaptive baselines, and set a
-    /// new stream start time.
+    /// Clear all streaming state, including the noise floor, and set a new
+    /// stream start time.
     pub fn reset(&mut self, stream_start_time: AudioTimestamp) {
         self.config.stream_start_time = stream_start_time;
-        let bins = self.fft.make_output_vec().len();
-        *self.lock_state() = DetectorState::new(&self.config, bins);
+        *self.lock_state() = DetectorState::new(&self.config);
     }
 
     /// Detect speech in the next block of samples from the stream.
@@ -149,7 +120,7 @@ impl VadDetector {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Processing`] if framing or the FFT fails.
+    /// Returns [`Error::Processing`] if a segment time cannot be computed.
     pub fn detect(&self, samples: &[f32]) -> Result<Vec<SpeechChunk>> {
         self.run(samples, false)
     }
@@ -160,7 +131,7 @@ impl VadDetector {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Processing`] if the FFT fails.
+    /// Same as [`detect`](Self::detect).
     pub fn flush(&self) -> Result<Vec<SpeechChunk>> {
         self.run(&[], true)
     }
@@ -173,29 +144,18 @@ impl VadDetector {
         if let Some(first) = state.warmup.as_ref().and_then(|w| w.first()) {
             return first.start_sample;
         }
-        state
+        // A segment is reported with leading padding, so audio up to one
+        // padding length before its start (or before the next unanalyzed
+        // frame, where a new segment could begin) is still undecided.
+        let next_start = state
             .active_segment
             .as_ref()
             .map_or(state.carry_start, |seg| {
                 seg.start_sample.min(state.carry_start)
-            })
-    }
-
-    /// Seed the noise baselines from the warm-up frames.
-    ///
-    /// The quietest frame's energy is used rather than the first frame's, so a
-    /// stream that starts mid-speech still gets a background estimate from
-    /// the dips between syllables. Flux uses the median, skipping frame 0,
-    /// whose flux is measured against an empty spectrum.
-    fn seed_baselines(&self, frames: &[FrameMetrics], state: &mut DetectorState) {
-        if let Some(energy) = frames.iter().map(|f| f.energy).min_by(f32::total_cmp) {
-            state.energy_baseline = energy.max(self.config.energy_floor).max(EPSILON);
-        }
-        let mut flux: Vec<f32> = frames.iter().skip(1).map(|f| f.flux).collect();
-        flux.sort_by(f32::total_cmp);
-        if let Some(&median) = flux.get(flux.len() / 2) {
-            state.flux_baseline = median.max(self.config.flux_floor).max(EPSILON);
-        }
+            });
+        next_start
+            .saturating_sub(self.padding_samples)
+            .max(state.last_segment_end.min(next_start))
     }
 
     /// First stream sample not yet covered by a complete analysis frame.
@@ -207,85 +167,68 @@ impl VadDetector {
     pub(crate) fn open_segment(&self, end_sample: usize) -> Option<SpeechChunk> {
         let state = self.lock_state();
         let seg = state.active_segment.as_ref()?;
-        let frames = seg.frame_count.max(1) as f32;
+        // Same leading padding as a closed segment gets.
+        let start = seg
+            .start_sample
+            .saturating_sub(self.padding_samples)
+            .max(state.last_segment_end);
         Some(SpeechChunk {
-            start_time: self.absolute_time_for_sample(seg.start_sample).ok()?,
+            start_time: self.absolute_time_for_sample(start).ok()?,
             end_time: self.absolute_time_for_sample(end_sample).ok()?,
-            confidence: (seg.score_sum / frames).clamp(0.0, 1.0),
-            avg_energy: seg.energy_sum / frames,
+            confidence: seg.confidence(),
+            avg_energy: seg.avg_energy(),
             frame_count: seg.frame_count,
         })
     }
 
     fn run(&self, samples: &[f32], finish: bool) -> Result<Vec<SpeechChunk>> {
         let detection_start = AudioInstant::now();
-        let mut detector_state = self.lock_state();
+        let mut state = self.lock_state();
 
-        detector_state.processed_samples += samples.len();
-        let chunk_end_sample = detector_state.processed_samples;
+        state.processed_samples += samples.len();
+        let chunk_end_sample = state.processed_samples;
 
-        let frames = self.frame_signal(samples, finish, &mut detector_state)?;
-        let mut metrics = if frames.is_empty() {
-            Vec::new()
-        } else {
-            let energy = Self::compute_energy(&frames);
-            let flux = self.compute_spectral_flux(&frames, &mut detector_state)?;
-            frames
-                .iter()
-                .zip(energy)
-                .zip(flux)
-                .map(|((frame, energy), flux)| FrameMetrics {
-                    start_sample: frame.start_sample,
-                    valid_len: frame.valid_len,
-                    energy,
-                    flux,
-                })
-                .collect()
-        };
+        let mut frames = self.frame_signal(samples, finish, &mut state)?;
 
         // Hold the first frames back until the background level can be
-        // estimated from them.
-        if let Some(warmup) = detector_state.warmup.as_mut() {
-            warmup.append(&mut metrics);
+        // estimated from them. The quietest one is used rather than the
+        // first, so a stream that starts mid-speech still gets an estimate
+        // from the dips between syllables.
+        if let Some(warmup) = state.warmup.as_mut() {
+            warmup.append(&mut frames);
             if warmup.len() >= self.warmup_frames || finish {
-                metrics = std::mem::take(warmup);
-                detector_state.warmup = None;
-                self.seed_baselines(&metrics, &mut detector_state);
+                frames = std::mem::take(warmup);
+                state.warmup = None;
+                if let Some(quietest) = frames.iter().map(|f| f.energy).min_by(f32::total_cmp) {
+                    state.noise_floor = quietest.max(self.config.energy_floor);
+                }
             }
         }
 
-        let (mut chunks, stats) = if metrics.is_empty() {
-            (Vec::new(), VadStats::default())
-        } else {
-            self.merge_metrics(&metrics, chunk_end_sample, &mut detector_state)?
-        };
+        let (mut chunks, stats) = self.classify(&frames, chunk_end_sample, &mut state)?;
 
         if finish {
-            if let Some(segment) = detector_state.active_segment.take() {
-                self.finalize_segment(&segment, chunk_end_sample, &mut chunks)?;
-                detector_state.last_segment_end = segment.last_end_sample.min(chunk_end_sample);
+            if let Some(segment) = state.active_segment.take() {
+                let prev_end = state.last_segment_end;
+                state.last_segment_end =
+                    self.finalize_segment(&segment, chunk_end_sample, prev_end, &mut chunks)?;
             }
         }
 
-        let adaptive = AdaptiveThresholdSnapshot {
-            energy_baseline: detector_state.energy_baseline,
-            flux_baseline: detector_state.flux_baseline,
-            dynamic_threshold: detector_state.dynamic_threshold,
-        };
-        drop(detector_state);
+        let noise_floor = state.noise_floor;
+        drop(state);
 
-        let latency = AudioInstant::now().duration_since(detection_start);
         let snapshot = VadMetricsSnapshot {
             stats,
-            latency,
-            adaptive,
+            latency: AudioInstant::now().duration_since(detection_start),
+            noise_floor,
         };
         self.metrics.record_vad_metrics(&snapshot);
 
         Ok(chunks)
     }
 
-    /// Split the stream into analysis frames.
+    /// Split the stream into analysis frames and measure each one.
     ///
     /// New samples are pre-emphasized and appended to the samples left over
     /// from earlier calls, so frames always sit on one grid regardless of how
@@ -296,9 +239,8 @@ impl VadDetector {
         samples: &[f32],
         finish: bool,
         state: &mut DetectorState,
-    ) -> Result<Vec<Frame>> {
-        let processed = self.preprocess_signal(samples, state);
-        state.carry.extend_from_slice(&processed);
+    ) -> Result<Vec<FrameMetrics>> {
+        self.pre_emphasize(samples, state);
 
         let frame_length = self.config.frame_length_samples()?;
         let hop_length = self.config.hop_length_samples()?;
@@ -307,24 +249,24 @@ impl VadDetector {
         let mut start = 0usize;
         loop {
             let available = state.carry.len().saturating_sub(start);
-            let complete = available >= frame_length;
-            if !(complete || (finish && available > 0)) {
+            if !(available >= frame_length || (finish && available > 0)) {
                 break;
             }
-
-            let slice = state.carry.get(start..start + available.min(frame_length));
-            let mut frame: Vec<f32> = slice
-                .unwrap_or_default()
+            let valid_len = available.min(frame_length);
+            let frame = state
+                .carry
+                .get(start..start + valid_len)
+                .unwrap_or_default();
+            // Hann-windowed RMS; a short final frame counts as zero-padded.
+            let sum_sq: f32 = frame
                 .iter()
                 .zip(&self.window)
-                .map(|(sample, window)| sample * window)
-                .collect();
-            frame.resize(frame_length, 0.0);
-
-            frames.push(Frame {
-                data: frame,
+                .map(|(sample, window)| (sample * window).powi(2))
+                .sum();
+            frames.push(FrameMetrics {
                 start_sample: state.carry_start + start,
-                valid_len: available.min(frame_length),
+                valid_len,
+                energy: (sum_sq / frame_length as f32).sqrt(),
             });
             start += hop_length;
         }
@@ -340,277 +282,145 @@ impl VadDetector {
         Ok(frames)
     }
 
-    fn preprocess_signal(&self, samples: &[f32], state: &mut DetectorState) -> Vec<f32> {
-        match self.config.pre_emphasis {
-            Some(coeff) if coeff > 0.0 => {
-                let mut processed = Vec::with_capacity(samples.len());
-                let mut previous = state.pre_emphasis_prev;
-                for &sample in samples {
-                    let emphasized = coeff.mul_add(-previous, sample);
-                    processed.push(emphasized);
-                    previous = sample;
-                }
-                if let Some(&last) = samples.last() {
-                    state.pre_emphasis_prev = last;
-                }
-                processed
-            }
-            _ => {
-                if let Some(&last) = samples.last() {
-                    state.pre_emphasis_prev = last;
-                }
-                samples.to_vec()
-            }
-        }
+    /// Append `samples` to the frame buffer, applying the pre-emphasis
+    /// filter `y[n] = x[n] - a * x[n-1]` if it is enabled.
+    fn pre_emphasize(&self, samples: &[f32], state: &mut DetectorState) {
+        let coeff = self.config.pre_emphasis.unwrap_or(0.0);
+        let mut previous = state.pre_emphasis_prev;
+        state.carry.extend(samples.iter().map(|&sample| {
+            let emphasized = coeff.mul_add(-previous, sample);
+            previous = sample;
+            emphasized
+        }));
+        state.pre_emphasis_prev = previous;
     }
 
-    fn compute_energy(frames: &[Frame]) -> Vec<f32> {
-        let mut values = Vec::with_capacity(frames.len());
-
-        for frame in frames {
-            debug_assert!(!frame.data.is_empty(), "frame data should never be empty");
-            let sum_sq: f32 = frame.data.iter().map(|sample| sample * sample).sum();
-            let len = frame.data.len();
-            let rms = (sum_sq / len as f32).sqrt();
-
-            values.push(rms);
-        }
-
-        values
-    }
-
-    fn compute_spectral_flux(
-        &self,
-        frames: &[Frame],
-        state: &mut DetectorState,
-    ) -> Result<Vec<f32>> {
-        if frames.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut input = self.fft.make_input_vec();
-        let mut spectrum = self.fft.make_output_vec();
-        let mut scratch = self.fft.make_scratch_vec();
-        if state.previous_spectrum.len() != spectrum.len() {
-            state.previous_spectrum.resize(spectrum.len(), 0.0);
-        }
-        let previous = &mut state.previous_spectrum;
-
-        let mut values = Vec::with_capacity(frames.len());
-
-        for frame in frames {
-            debug_assert!(!frame.data.is_empty(), "frame data should never be empty");
-            input.fill(0.0);
-            let len = frame.data.len().min(input.len());
-            for (dst, &src) in input.iter_mut().zip(frame.data.iter()).take(len) {
-                *dst = src;
-            }
-
-            self.fft
-                .process_with_scratch(&mut input, &mut spectrum, &mut scratch)
-                .map_err(|err| Error::Processing(format!("FFT processing failed: {err}")))?;
-
-            let mut flux = 0.0f32;
-            for (bin, prev) in spectrum.iter().zip(previous.iter_mut()) {
-                let magnitude = bin.re.hypot(bin.im);
-                let diff = (magnitude - *prev).max(0.0);
-                flux += diff;
-                *prev = magnitude;
-            }
-
-            values.push(flux);
-        }
-
-        Ok(values)
-    }
-
-    fn merge_metrics(
+    /// Classify frames as speech or silence, update the noise floor, and
+    /// collect the segments that close.
+    fn classify(
         &self,
         frames: &[FrameMetrics],
         chunk_end_sample: usize,
-        detector_state: &mut DetectorState,
+        state: &mut DetectorState,
     ) -> Result<(Vec<SpeechChunk>, VadStats)> {
         let mut stats = VadStats::default();
         let mut segments = Vec::new();
-
-        let mut dynamic_threshold = detector_state.dynamic_threshold.max(EPSILON);
-        let mut energy_baseline = detector_state
-            .energy_baseline
-            .max(self.config.energy_floor)
-            .max(EPSILON);
-        let mut flux_baseline = detector_state
-            .flux_baseline
-            .max(self.config.flux_floor)
-            .max(EPSILON);
-
-        let silence_energy_smoothing = self.config.energy_smoothing.min(MAX_SMOOTHING_FACTOR);
-        let silence_flux_smoothing = self.config.flux_smoothing.min(MAX_SMOOTHING_FACTOR);
-        let silence_threshold_smoothing = self.config.threshold_smoothing.min(MAX_SMOOTHING_FACTOR);
-
-        let dynamic_threshold_min =
-            (self.config.base_threshold * self.config.release_margin).max(EPSILON);
-        let dynamic_threshold_max =
-            self.config.base_threshold * self.config.activation_margin * 2.0;
-
-        let mut active_segment = detector_state.active_segment.take();
-        let mut last_segment_end = detector_state.last_segment_end;
-        let mut silence_run = active_segment
-            .as_ref()
-            .map_or(0usize, |state| state.silence_run);
+        let smoothing = self.config.noise_smoothing;
 
         for frame in frames {
-            let (raw_energy, raw_flux) = (frame.energy, frame.flux);
-
-            let energy_denominator = energy_baseline.max(self.config.energy_floor).max(EPSILON);
-            let normalized_energy =
-                (raw_energy / energy_denominator).clamp(0.0, MAX_NORMALIZED_METRIC);
-            let flux_denominator = flux_baseline.max(self.config.flux_floor).max(EPSILON);
-            let normalized_flux = (raw_flux / flux_denominator).clamp(0.0, MAX_NORMALIZED_METRIC);
-            let energy_ratio = raw_energy / energy_denominator;
-
-            let combined = self
-                .energy_weight
-                .mul_add(normalized_energy, self.flux_weight * normalized_flux);
-
-            let base_threshold = if active_segment.is_some() {
-                dynamic_threshold * self.config.release_margin
+            let ratio = frame.energy / state.noise_floor;
+            let required = if state.active_segment.is_some() {
+                self.config.release_ratio
             } else {
-                dynamic_threshold * self.config.activation_margin
+                self.config.activation_ratio
             };
-            let threshold =
-                base_threshold.max(self.config.base_threshold * self.config.release_margin);
-            let low_energy = raw_energy < self.config.min_speech_energy;
-            let low_relative_energy = energy_ratio < SILENCE_RELATIVE_GATE;
-            let mut raw_is_speech = combined >= threshold;
-            if raw_is_speech && (low_energy || low_relative_energy) {
-                raw_is_speech = false;
-            }
-
-            let is_speech = if active_segment.is_some() {
-                if raw_is_speech {
-                    silence_run = 0;
-                    true
-                } else {
-                    silence_run += 1;
-                    silence_run <= self.config.hangover_frames
-                }
-            } else {
-                silence_run = 0;
-                raw_is_speech
-            };
-
-            if is_speech {
-                // Overlapping frames can make a new segment start before the
-                // previous one ended; never let segments overlap.
-                let start = frame.start_sample.max(last_segment_end);
-                let segment_state =
-                    active_segment.get_or_insert_with(|| ActiveSegmentState::new(start));
-                segment_state.score_sum += combined;
-                segment_state.energy_sum += raw_energy;
-                segment_state.frame_count += 1;
-                segment_state.last_end_sample = frame.start_sample + frame.valid_len.max(1);
-                segment_state.silence_run = silence_run;
-            } else if let Some(segment_state) = active_segment.take() {
-                let finalize_result =
-                    self.finalize_segment(&segment_state, chunk_end_sample, &mut segments);
-                if let Err(err) = finalize_result {
-                    detector_state.active_segment = Some(segment_state);
-                    return Err(err);
-                }
-                last_segment_end = segment_state.last_end_sample.min(chunk_end_sample);
-                silence_run = 0;
-            }
+            let loud = frame.energy >= self.config.min_speech_energy && ratio >= required;
 
             stats.frames_processed += 1;
-            if is_speech {
+            if loud {
                 stats.speech_frames += 1;
             } else {
                 stats.silence_frames += 1;
             }
 
-            if is_speech {
-                // Track the noise floor through speech as well: follow dips
-                // quickly and rise slowly. Without this, a recording that
-                // starts with noise above the gate is classified as speech
-                // from the first frame and the baselines never adapt.
-                energy_baseline =
-                    track_floor(energy_baseline, raw_energy, silence_energy_smoothing);
-                flux_baseline = track_floor(flux_baseline, raw_flux, silence_flux_smoothing);
-            } else {
-                dynamic_threshold = silence_threshold_smoothing.mul_add(
-                    dynamic_threshold,
-                    (1.0 - silence_threshold_smoothing) * combined,
-                );
-                energy_baseline = silence_energy_smoothing.mul_add(
-                    energy_baseline,
-                    (1.0 - silence_energy_smoothing) * raw_energy,
-                );
-                flux_baseline = silence_flux_smoothing
-                    .mul_add(flux_baseline, (1.0 - silence_flux_smoothing) * raw_flux);
+            // A quiet frame inside a segment is a pause until more than
+            // `hangover_frames` of them in a row close it.
+            let in_speech = match state.active_segment.as_mut() {
+                Some(segment) if loud => {
+                    segment.silence_run = 0;
+                    true
+                }
+                Some(segment) => {
+                    segment.silence_run += 1;
+                    segment.silence_run <= self.config.hangover_frames
+                }
+                None => loud,
+            };
+
+            if loud {
+                // Overlapping frames can make a new segment start before the
+                // previous one ended; never let segments overlap.
+                let start = frame.start_sample.max(state.last_segment_end);
+                let segment = state
+                    .active_segment
+                    .get_or_insert_with(|| ActiveSegmentState::new(start));
+                // Only loud frames extend the segment; hangover frames keep
+                // it open without moving its end.
+                segment.ratio_score_sum += ratio.log10().clamp(0.0, 1.0);
+                segment.energy_sum += frame.energy;
+                segment.frame_count += 1;
+                segment.last_end_sample = frame.start_sample + frame.valid_len.max(1);
+            } else if !in_speech {
+                if let Some(segment) = state.active_segment.take() {
+                    state.last_segment_end = self.finalize_segment(
+                        &segment,
+                        chunk_end_sample,
+                        state.last_segment_end,
+                        &mut segments,
+                    )?;
+                }
             }
 
-            dynamic_threshold =
-                dynamic_threshold.clamp(dynamic_threshold_min, dynamic_threshold_max);
-            energy_baseline = energy_baseline.max(self.config.energy_floor).max(EPSILON);
-            flux_baseline = flux_baseline.max(self.config.flux_floor).max(EPSILON);
-        }
-
-        detector_state.dynamic_threshold = dynamic_threshold;
-        detector_state.energy_baseline = energy_baseline;
-        detector_state.flux_baseline = flux_baseline;
-        detector_state.last_segment_end = last_segment_end;
-
-        // Keep the open segment for the next call; `flush` closes it.
-        if let Some(mut segment_state) = active_segment {
-            segment_state.silence_run = silence_run;
-            detector_state.active_segment = Some(segment_state);
-        } else {
-            detector_state.active_segment = None;
+            // Track the noise floor through speech as well: follow dips
+            // quickly and rise slowly. Without this, a recording that starts
+            // with noise above the gate is classified as speech from the
+            // first frame and the floor never adapts.
+            let floor = state.noise_floor;
+            let weight = if in_speech && frame.energy > floor {
+                SPEECH_FLOOR_RISE
+            } else {
+                smoothing
+            };
+            state.noise_floor = weight
+                .mul_add(floor, (1.0 - weight) * frame.energy)
+                .max(self.config.energy_floor);
         }
 
         Ok((segments, stats))
     }
 
+    /// Report a closed segment, padded by `speech_padding` on both sides
+    /// without overlapping the previous segment (`prev_end`) or reaching past
+    /// the audio received so far. Returns the end to use as the new
+    /// `prev_end`.
     fn finalize_segment(
         &self,
         segment: &ActiveSegmentState,
         chunk_end_sample: usize,
+        prev_end: usize,
         segments: &mut Vec<SpeechChunk>,
-    ) -> Result<()> {
-        if segment.last_end_sample <= segment.start_sample {
-            return Ok(());
+    ) -> Result<usize> {
+        let unpadded_end = segment.last_end_sample.min(chunk_end_sample);
+        if segment.last_end_sample <= segment.start_sample
+            || segment.frame_count < self.config.min_speech_frames
+        {
+            return Ok(unpadded_end.max(prev_end));
         }
 
-        if segment.frame_count < self.config.min_speech_frames {
-            return Ok(());
-        }
-
-        let clamped_end = segment
+        let start = segment
+            .start_sample
+            .saturating_sub(self.padding_samples)
+            .max(prev_end);
+        let end = segment
             .last_end_sample
+            .saturating_add(self.padding_samples)
             .min(chunk_end_sample.max(segment.start_sample + 1));
-        let start_time = self.absolute_time_for_sample(segment.start_sample)?;
-        let end_time = self.absolute_time_for_sample(clamped_end)?;
+        let start_time = self.absolute_time_for_sample(start)?;
+        let end_time = self.absolute_time_for_sample(end)?;
 
         if end_time <= start_time {
-            return Ok(());
+            return Ok(unpadded_end.max(prev_end));
         }
-
-        let confidence = (segment.score_sum / segment.frame_count as f32).clamp(0.0, 1.0);
-        let avg_energy = if segment.frame_count > 0 {
-            segment.energy_sum / segment.frame_count as f32
-        } else {
-            0.0
-        };
 
         segments.push(SpeechChunk {
             start_time,
             end_time,
-            confidence,
-            avg_energy,
+            confidence: segment.confidence(),
+            avg_energy: segment.avg_energy(),
             frame_count: segment.frame_count,
         });
 
-        Ok(())
+        Ok(end)
     }
 
     fn absolute_time_for_sample(&self, sample_index: usize) -> Result<AudioTimestamp> {
@@ -619,35 +429,10 @@ impl VadDetector {
     }
 }
 
-/// Audio buffered at the start of a stream to estimate the background level
-/// before any frame is classified.
-const WARMUP: AudioDuration = AudioDuration::from_millis(300);
-
-/// Per-frame factor for raising a baseline during speech. With the default
-/// 10 ms hop the baseline needs a few seconds of sustained level to rise,
-/// while words and syllables only nudge it.
-const SPEECH_FLOOR_RISE: f32 = 0.998;
-
-/// Noise-floor update during speech: fall like a normal baseline update when
-/// the frame is quieter, rise slowly when it is louder.
-fn track_floor(baseline: f32, value: f32, fall_smoothing: f32) -> f32 {
-    let smoothing = if value < baseline {
-        fall_smoothing
-    } else {
-        SPEECH_FLOOR_RISE
-    };
-    smoothing.mul_add(baseline, (1.0 - smoothing) * value)
-}
-
 fn hann_window(length: usize) -> Vec<f32> {
-    if length == 0 {
-        return Vec::new();
-    }
-
     if length == 1 {
         return vec![1.0];
     }
-
     let denom = (length - 1) as f32;
     (0..length)
         .map(|n| {
@@ -663,63 +448,55 @@ fn samples_to_duration(samples: usize, sample_rate: u32) -> AudioDuration {
     AudioDuration::from_nanos(nanos as u64)
 }
 
-struct Frame {
-    data: Vec<f32>,
-    start_sample: usize,
-    valid_len: usize,
-}
-
-/// Per-frame measurements fed to the decision logic.
+/// Energy of one analysis frame.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct FrameMetrics {
+struct FrameMetrics {
     start_sample: usize,
+    /// Real (not zero-padded) samples in the frame.
     valid_len: usize,
     energy: f32,
-    flux: f32,
 }
 
-pub(super) struct DetectorState {
+struct DetectorState {
     /// Samples received so far.
-    pub(super) processed_samples: usize,
+    processed_samples: usize,
     /// Measurements of the first frames of the stream, held back until
     /// there are enough to estimate the background level. `None` once the
-    /// baselines have been seeded.
-    pub(super) warmup: Option<Vec<FrameMetrics>>,
+    /// noise floor has been seeded.
+    warmup: Option<Vec<FrameMetrics>>,
     /// Pre-emphasized samples not yet consumed by a complete frame.
-    pub(super) carry: Vec<f32>,
+    carry: Vec<f32>,
     /// Stream index of `carry[0]`.
-    pub(super) carry_start: usize,
+    carry_start: usize,
     /// End of the last closed segment; new segments start at or after it.
-    pub(super) last_segment_end: usize,
-    pub(super) energy_baseline: f32,
-    pub(super) flux_baseline: f32,
-    pub(super) dynamic_threshold: f32,
-    pub(super) previous_spectrum: Vec<f32>,
-    pub(super) pre_emphasis_prev: f32,
-    pub(super) active_segment: Option<ActiveSegmentState>,
+    last_segment_end: usize,
+    /// Running estimate of the background frame energy.
+    noise_floor: f32,
+    pre_emphasis_prev: f32,
+    active_segment: Option<ActiveSegmentState>,
 }
 
-pub(super) struct ActiveSegmentState {
-    pub(super) start_sample: usize,
-    pub(super) last_end_sample: usize,
-    pub(super) score_sum: f32,
-    pub(super) energy_sum: f32,
-    pub(super) frame_count: usize,
-    pub(super) silence_run: usize,
+struct ActiveSegmentState {
+    start_sample: usize,
+    /// End of the last loud frame.
+    last_end_sample: usize,
+    ratio_score_sum: f32,
+    energy_sum: f32,
+    /// Loud frames in the segment (hangover frames are not counted).
+    frame_count: usize,
+    /// Quiet frames since the last loud one.
+    silence_run: usize,
 }
 
 impl DetectorState {
-    fn new(config: &VadConfig, spectrum_bins: usize) -> Self {
+    fn new(config: &VadConfig) -> Self {
         Self {
             processed_samples: 0,
             warmup: Some(Vec::new()),
             carry: Vec::new(),
             carry_start: 0,
             last_segment_end: 0,
-            energy_baseline: config.energy_floor.max(EPSILON),
-            flux_baseline: config.flux_floor.max(EPSILON),
-            dynamic_threshold: config.base_threshold.max(EPSILON),
-            previous_spectrum: vec![0.0; spectrum_bins],
+            noise_floor: config.energy_floor,
             pre_emphasis_prev: 0.0,
             active_segment: None,
         }
@@ -727,35 +504,51 @@ impl DetectorState {
 }
 
 impl ActiveSegmentState {
-    pub(super) fn new(start_sample: usize) -> Self {
+    fn new(start_sample: usize) -> Self {
         Self {
             start_sample,
             last_end_sample: start_sample,
-            score_sum: 0.0,
+            ratio_score_sum: 0.0,
             energy_sum: 0.0,
             frame_count: 0,
             silence_run: 0,
         }
     }
+
+    fn confidence(&self) -> f32 {
+        self.ratio_score_sum / self.frame_count.max(1) as f32
+    }
+
+    fn avg_energy(&self) -> f32 {
+        self.energy_sum / self.frame_count.max(1) as f32
+    }
 }
 
-/// Speech segment with temporal metadata emitted by the detector.
+/// A detected speech segment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeechChunk {
-    /// Start time of the detected speech segment.
+    /// Start of the segment, including `speech_padding`.
     pub start_time: AudioTimestamp,
-    /// End time of the detected speech segment.
+    /// End of the segment, including `speech_padding`.
     pub end_time: AudioTimestamp,
-    /// Aggregated confidence score derived from combined metrics.
+    /// How far the speech frames rise above the noise floor, from 0.0 (at
+    /// the floor) to 1.0 (20 dB or more above it), averaged over the
+    /// segment.
     pub confidence: f32,
-    /// Average energy observed within the segment.
+    /// Mean RMS of the speech frames, measured after pre-emphasis and
+    /// windowing.
     pub avg_energy: f32,
-    /// Number of frames that contributed to the segment.
+    /// Number of speech frames in the segment. Hangover frames are not
+    /// counted.
     pub frame_count: usize,
 }
 
 impl SpeechChunk {
     /// Duration of the speech segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Processing`] if `end_time` precedes `start_time`.
     pub fn duration(&self) -> Result<AudioDuration> {
         self.end_time
             .duration_since(self.start_time)
@@ -798,10 +591,11 @@ mod tests {
         let detector = VadDetector::new(VadConfig::default()).unwrap();
         let segments = detector.detect(&tone_burst(0.5, 1.0)).unwrap();
 
+        // Boundaries include the default 50 ms of padding on each side.
         assert_eq!(segments.len(), 1);
         let seg = segments[0];
-        assert!((seg.start_time.as_secs() - 0.5).abs() < 0.05, "{seg:?}");
-        assert!((seg.end_time.as_secs() - 1.5).abs() < 0.1, "{seg:?}");
+        assert!((seg.start_time.as_secs() - 0.45).abs() < 0.03, "{seg:?}");
+        assert!((seg.end_time.as_secs() - 1.55).abs() < 0.03, "{seg:?}");
     }
 
     #[test]
@@ -930,12 +724,67 @@ mod tests {
 
         assert_eq!(segments.len(), 2, "{segments:?}");
         for (seg, start) in segments.iter().zip([2.0, 4.0]) {
-            assert!((seg.start_time.as_secs() - start).abs() < 0.05, "{seg:?}");
+            // Includes 50 ms of leading padding.
+            assert!(
+                (seg.start_time.as_secs() - (start - 0.05)).abs() < 0.03,
+                "{seg:?}"
+            );
             assert!(
                 (seg.end_time.as_secs() - (start + 0.6)).abs() < 0.1,
                 "{seg:?}"
             );
         }
+    }
+
+    fn detect_all(config: VadConfig, audio: &[f32]) -> Vec<SpeechChunk> {
+        let detector = VadDetector::new(config).unwrap();
+        let mut segments = detector.detect(audio).unwrap();
+        segments.extend(detector.flush().unwrap());
+        segments
+    }
+
+    /// White noise with a loud 1 kHz tone at 1.0-1.2 s followed directly by
+    /// a soft one at 1.2-1.6 s, about twice the noise level.
+    fn loud_then_soft() -> Vec<f32> {
+        let mut audio = noise(SR * 3, 0.02, false);
+        for (i, s) in audio[SR..SR * 16 / 10].iter_mut().enumerate() {
+            let amplitude = if i < SR / 5 { 0.3 } else { 0.1 };
+            *s += amplitude * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
+        }
+        audio
+    }
+
+    #[test]
+    fn release_ratio_keeps_the_soft_end_of_a_segment() {
+        let segments = detect_all(VadConfig::default(), &loud_then_soft());
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert!(
+            (segments[0].end_time.as_secs() - 1.65).abs() < 0.05,
+            "{segments:?}"
+        );
+
+        // Without hysteresis the soft part is too quiet to keep it open.
+        let strict = VadConfig {
+            release_ratio: 2.5,
+            ..VadConfig::default()
+        };
+        let segments = detect_all(strict, &loud_then_soft());
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert!(
+            (segments[0].end_time.as_secs() - 1.25).abs() < 0.05,
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn confidence_follows_level_above_the_noise_floor() {
+        let clean = detect_all(VadConfig::default(), &tone_burst(1.0, 1.0));
+        let soft = detect_all(VadConfig::default(), &loud_then_soft());
+        assert!(clean[0].confidence > 0.9, "{clean:?}");
+        assert!(
+            soft[0].confidence > 0.2 && soft[0].confidence < 0.7,
+            "{soft:?}"
+        );
     }
 
     #[test]

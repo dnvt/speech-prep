@@ -95,6 +95,9 @@ pub struct Pipeline {
     max_hold: usize,
     /// Part of the currently open segment has already been emitted.
     continuing_speech: bool,
+    /// RMS of the last silence chunk, for the SNR of speech chunks emitted
+    /// from a window with no silence of its own.
+    noise_rms: Option<f32>,
 }
 
 /// Default for [`Pipeline::with_max_speech_hold`].
@@ -156,6 +159,7 @@ impl Pipeline {
             last_tail: None,
             max_hold: 0,
             continuing_speech: false,
+            noise_rms: None,
         }
         .with_max_speech_hold(DEFAULT_MAX_SPEECH_HOLD);
         // Components may have been used before; the pipeline counts samples
@@ -279,6 +283,7 @@ impl Pipeline {
         self.pending_start = 0;
         self.last_tail = None;
         self.continuing_speech = false;
+        self.noise_rms = None;
     }
 
     /// Emit whole chunks from an open speech segment that has been held
@@ -288,9 +293,11 @@ impl Pipeline {
         if analyzed.saturating_sub(self.pending_start) <= self.max_hold {
             return Ok(Vec::new());
         }
-        let Some(seg_start) = self.vad.active_segment_start_sample() else {
+        if self.vad.active_segment_start_sample().is_none() {
             return Ok(Vec::new());
-        };
+        }
+        // Padded start of the open segment.
+        let seg_start = self.vad.undecided_from();
 
         let target = Chunker::duration_to_samples(
             self.chunker.config().target_duration,
@@ -362,6 +369,19 @@ impl Pipeline {
             }
         }
 
+        // A window with no silence in it (held speech, or the end of a
+        // stream) gives the chunker nothing to measure noise from; fall back
+        // to the last silence seen. Both levels are measured before cleanup.
+        for chunk in &mut chunks {
+            if chunk.is_silence() {
+                self.noise_rms = Some(chunk.energy).filter(|&rms| rms > 0.0);
+            } else if chunk.snr_db.is_none() {
+                chunk.snr_db = self
+                    .noise_rms
+                    .and_then(|noise| Chunker::calculate_snr_db(chunk.energy, noise));
+            }
+        }
+
         let preprocess_start = AudioInstant::now();
         for chunk in &mut chunks {
             let ctx = Some(VadContext {
@@ -381,11 +401,7 @@ impl Pipeline {
         );
         apply_overlaps(&mut chunks, overlap, STANDARD_SAMPLE_RATE);
         if let Some(first) = chunks.first_mut() {
-            first.overlap_prev = self.last_tail.take();
-            if first.overlap_next.is_none() {
-                let len = first.overlap_prev.as_ref().map_or(0, Vec::len);
-                first.overlap_ms = (len as u64 * 1000 / u64::from(STANDARD_SAMPLE_RATE)) as u32;
-            }
+            first.set_overlap_prev(self.last_tail.take(), STANDARD_SAMPLE_RATE);
         }
         self.last_tail = chunks.last().map(|last| {
             let from = last.samples.len().saturating_sub(overlap);
@@ -420,7 +436,10 @@ mod tests {
 
     const SR: usize = 16_000;
 
-    /// `lead` s of silence, `tone` s of 1 kHz, `tail` s of silence.
+    /// `lead` s of silence, `tone` s of speech-like sound, `tail` s of
+    /// silence. The "speech" is 150 Hz voiced harmonics with 10 dB syllable
+    /// dips at 4 Hz; a steady tone would be absorbed into the background
+    /// after a few seconds, as any stationary sound is.
     fn burst(lead: f32, tone: f32, tail: f32) -> Vec<f32> {
         let (lead, tone, tail) = (
             (lead * SR as f32) as usize,
@@ -429,7 +448,13 @@ mod tests {
         );
         let mut audio = vec![0.0f32; lead + tone + tail];
         for (i, s) in audio[lead..lead + tone].iter_mut().enumerate() {
-            *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
+            let t = i as f32 / SR as f32;
+            let phase = 2.0 * std::f32::consts::PI * 4.0 * t;
+            let envelope = 0.684f32.mul_add(0.5f32.mul_add(-phase.cos(), 0.5), 0.316);
+            let voiced: f32 = (1..=15)
+                .map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32)
+                .sum();
+            *s = 0.3 * envelope * voiced;
         }
         audio
     }
@@ -628,16 +653,43 @@ mod tests {
     }
 
     #[test]
-    fn overlap_ms_matches_overlap_vectors() {
+    fn held_speech_chunks_get_an_snr() {
+        let mut audio = burst(1.0, 6.0, 0.5);
+        let mut state = 1u32;
+        for s in &mut audio {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s += 0.002 * (state as f32 / u32::MAX as f32 - 0.5);
+        }
+
+        let mut pipeline = Pipeline::new().unwrap();
+        let mut chunks = Vec::new();
+        for block in audio.chunks(1_600) {
+            chunks.extend(pipeline.process_samples(block).unwrap().chunks);
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        let speech: Vec<_> = chunks.iter().filter(|c| !c.is_silence()).collect();
+        assert!(speech.len() > 3);
+        for chunk in speech {
+            let snr = chunk.snr_db.unwrap_or_else(|| panic!("no SNR: {chunk:?}"));
+            assert!(snr > 20.0, "{snr}");
+        }
+    }
+
+    #[test]
+    fn context_is_the_previous_chunks_tail_across_calls() {
         let audio = burst(0.5, 1.0, 0.5);
         for block in [1_600, 4_000] {
-            for chunk in run_streamed(&audio, block) {
-                let len = chunk
-                    .overlap_next
-                    .as_ref()
-                    .or(chunk.overlap_prev.as_ref())
-                    .map_or(0, Vec::len);
-                assert_eq!(chunk.overlap_ms as usize, len * 1000 / SR, "{chunk:?}");
+            let chunks = run_streamed(&audio, block);
+            assert!(chunks[0].overlap_prev.is_none());
+            for pair in chunks.windows(2) {
+                let context = pair[1].overlap_prev.as_ref().expect("context");
+                let prev = &pair[0].samples;
+                assert_eq!(context[..], prev[prev.len() - context.len()..]);
+                assert_eq!(
+                    pair[1].overlap_ms as usize,
+                    (context.len() * 1000 + SR / 2) / SR
+                );
             }
         }
     }

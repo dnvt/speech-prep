@@ -6,8 +6,8 @@
 //! the codec, not the container: AAC and ALAC both live in `.m4a` files, and
 //! WAV can hold PCM or ADPCM.
 //!
-//! Detection does not guarantee decoding: Opus is recognized but has no
-//! decoder in this crate.
+//! Detection does not guarantee decoding: Opus is always recognized, but
+//! only decoded with the `opus` feature.
 
 use std::io::Cursor;
 
@@ -40,7 +40,7 @@ pub enum AudioFormat {
     Aac,
     /// Vorbis, in Ogg or WebM.
     Vorbis,
-    /// Opus, in Ogg or WebM. Detected but not decodable.
+    /// Opus, in Ogg or WebM. Decoded with the `opus` feature.
     Opus,
 }
 
@@ -69,7 +69,7 @@ impl AudioFormat {
     /// Map a Symphonia codec to a format, or `None` if this crate does not
     /// know it.
     pub(crate) fn from_codec(codec: AudioCodecId) -> Option<Self> {
-        let short_name = symphonia::default::get_codecs()
+        let short_name = crate::decoder::codecs()
             .get_audio_decoder(codec)
             .map(|decoder| decoder.codec.info.short_name)
             .unwrap_or_default();

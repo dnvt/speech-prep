@@ -71,7 +71,7 @@ fn main() -> speech_prep::Result<()> {
 | Module | What it does |
 |--------|--------------|
 | `converter` | Decode, downmix, and resample to 16 kHz mono `f32` |
-| `vad` | Voice activity detection from frame energy and spectral flux, with adaptive thresholds |
+| `vad` | Voice activity detection from frame energy against a tracked noise floor |
 | `chunker` | Split audio into ~500 ms chunks aligned to speech, with overlap context |
 | `preprocessing` | DC removal, Butterworth high-pass, spectral-subtraction denoising, RMS normalization, quality metrics |
 | `pipeline` | All of the above, streaming |
@@ -87,7 +87,14 @@ fn main() -> speech_prep::Result<()> {
 | MP3 | MP3 | yes |
 | AAC-LC | MP4/M4A | yes |
 | Vorbis | Ogg, WebM | yes |
-| Opus | Ogg, WebM | no: detected, then rejected with `Error::Unsupported` |
+| Opus | Ogg, WebM | with the `opus` feature |
+
+Opus support is opt-in because its pure-Rust decoder adds about 20
+dependencies and needs Rust 1.95:
+
+```toml
+speech-prep = { version = "0.2", features = ["opus"] }
+```
 
 Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia). Any
 channel count is averaged to mono, and sample rates from 4 to 768 kHz are
@@ -100,7 +107,7 @@ accepted.
   16 kHz output keeps the speech band but not the top of the spectrum.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
-  (`activation_margin`, `min_speech_energy`, `hangover_frames`).
+  (`activation_ratio`, `hangover_frames`, `speech_padding`).
 - **Noise reduction** handles steady noise (fans, hum, hiss). It won't
   remove other voices, music, or reverb.
 - **The pipeline** runs at 16 kHz, and `process_bytes` decodes its whole

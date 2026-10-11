@@ -17,7 +17,8 @@ pub trait VadMetricsCollector: Send + Sync {
 pub struct VadStats {
     /// Analysis frames processed.
     pub frames_processed: u64,
-    /// Frames classified as speech (including hangover frames).
+    /// Frames whose level marked them as speech. Hangover frames, which only
+    /// keep a segment open, count as silence.
     pub speech_frames: u64,
     /// Frames classified as silence.
     pub silence_frames: u64,
@@ -41,19 +42,9 @@ pub struct VadMetricsSnapshot {
     pub stats: VadStats,
     /// Wall-clock time spent in the call.
     pub latency: AudioDuration,
-    /// Adaptive threshold state at the end of the call.
-    pub adaptive: AdaptiveThresholdSnapshot,
-}
-
-/// Adaptive baseline and threshold state of the detector.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AdaptiveThresholdSnapshot {
-    /// Running energy baseline (updated during silence only).
-    pub energy_baseline: f32,
-    /// Running spectral-flux baseline (updated during silence only).
-    pub flux_baseline: f32,
-    /// Current decision threshold.
-    pub dynamic_threshold: f32,
+    /// Noise floor at the end of the call: the running estimate of the
+    /// background frame energy that speech is measured against.
+    pub noise_floor: f32,
 }
 
 /// Collector that discards every snapshot. Used by [`VadDetector::new`](super::VadDetector::new).
