@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.speech-prep]
 path = ".."
+features = ["opus"]
 
 [[bin]]
 name = "decode"

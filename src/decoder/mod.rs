@@ -4,12 +4,15 @@ mod mixer;
 mod resampler;
 
 use std::io::Cursor;
+use std::sync::OnceLock;
 
 use symphonia::core::audio::Channels;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::CODEC_ID_NULL_AUDIO;
+#[cfg(not(feature = "opus"))]
 use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader};
@@ -187,19 +190,34 @@ pub(crate) fn first_audio_track(reader: &dyn FormatReader) -> Option<(u32, &Audi
         })
 }
 
+/// Symphonia's built-in decoders, plus Opus when the `opus` feature is on.
+pub(crate) fn codecs() -> &'static CodecRegistry {
+    static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        #[cfg(feature = "opus")]
+        registry.register_audio_decoder::<symphonia_adapter_opus_rs::OpusAdapter>();
+        registry
+    })
+}
+
 /// Pick the first audio track and build a decoder for it.
 fn open_track(reader: &dyn FormatReader) -> Result<(u32, Box<dyn AudioDecoder>)> {
     let (id, params) = first_audio_track(reader)
         .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?;
+    #[cfg(not(feature = "opus"))]
     if params.codec == CODEC_ID_OPUS {
-        return Err(Error::Unsupported("Opus decoding is not available".into()));
+        return Err(Error::Unsupported(
+            "Opus decoding needs the `opus` feature".into(),
+        ));
     }
 
-    let decoder = symphonia::default::get_codecs()
+    let decoder = codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|_| {
             Error::Unsupported(
-                "no decoder for this codec (supported: PCM, FLAC, MP3, AAC-LC, Vorbis, ALAC, ADPCM)"
+                "no decoder for this codec (supported: PCM, ADPCM, FLAC, ALAC, MP3, AAC-LC, Vorbis, Opus with the `opus` feature)"
                     .into(),
             )
         })?;

@@ -26,6 +26,10 @@ uses [Semantic Versioning](https://semver.org/).
 - `VadDetector::flush` to analyze the last partial frame and close a segment
   that runs to the end of the stream.
 - `Error::Unsupported` for recognized but undecodable formats (Opus).
+- Opus decoding (Ogg and WebM) behind the optional `opus` feature, using the
+  pure-Rust `ruopus` decoder. Its output matches libopus to within float
+  rounding (121 dB SNR on speech). It is off by default because it adds
+  about 20 crates and needs Rust 1.95.
 - `cargo bench --bench throughput`, a `process_file` example, and
   `cargo fuzz` targets for decoding and the pipeline.
 
@@ -38,6 +42,8 @@ uses [Semantic Versioning](https://semver.org/).
 - **Breaking:** `VADStats` is now `vad::VadStats`.
 - **Breaking:** `ConversionMetadata` reports a single `conversion_time` and
   `original_channels` is a `u16`.
+- Opus input without the `opus` feature is `Error::Unsupported` with a
+  message naming the feature.
 - **Breaking:** `AudioFormat` names the codec, not the container, and is
   `#[non_exhaustive]`: `WebM` is gone (a WebM file reports `Vorbis` or
   `Opus`), `Alac` and `Adpcm` are new. `FormatDetector::detect` always
