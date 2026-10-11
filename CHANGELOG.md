@@ -20,6 +20,15 @@ uses [Semantic Versioning](https://semver.org/).
 - A `ChunkerConfig` built as a struct literal with a sub-millisecond
   `target_duration` is now `Error::Configuration` from `Chunker::chunk`
   instead of a divide-by-zero panic.
+- `NoiseReducer` now carries the last frame of the stream as real left-hand
+  context and keeps its STFT frames on one hop grid across calls, so a
+  continuous signal split across calls (at any sample, in blocks of any size)
+  no longer has a discontinuity at the leading edge of each chunk once a noise
+  profile is learned (previously each call zero-padded its own left edge and
+  restarted its frame grid). The trailing
+  edge of a call still lacks future context and is re-covered on the next
+  call; eliminating that residual entirely would require an output-lagging
+  (buffered) API, which is a separate change.
 - A truncated stream (cut mid-packet) is now rejected with `InvalidInput`
   instead of returning the partial audio decoded so far as `Ok`.
 - The decoder caps how many samples one decode may buffer (64 Mi interleaved,
