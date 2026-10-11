@@ -8,8 +8,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Decoding of FLAC, MP3, AAC (MP4/M4A), and Ogg/WebM Vorbis through
-  Symphonia, plus 8-bit, 32-bit, and float WAV. Any channel count is
+- Decoding of FLAC, ALAC, MP3, AAC (MP4/M4A), Ogg/WebM Vorbis, AIFF, CAF,
+  and ADPCM through Symphonia 0.6, plus 8-bit, 32-bit, float, mu-law, and
+  A-law WAV. Any channel count is
   downmixed to mono.
 - `AudioFormatConverter::convert_file` for reading from a path.
 - `Pipeline::process_samples` for already-decoded 16 kHz audio, and
@@ -34,6 +35,14 @@ uses [Semantic Versioning](https://semver.org/).
 - **Breaking:** `VADStats` is now `vad::VadStats`.
 - **Breaking:** `ConversionMetadata` reports a single `conversion_time` and
   `original_channels` is a `u16`.
+- **Breaking:** `AudioFormat` names the codec, not the container, and is
+  `#[non_exhaustive]`: `WebM` is gone (a WebM file reports `Vorbis` or
+  `Opus`), `Alac` and `Adpcm` are new. `FormatDetector::detect` always
+  probes the stream and fills in all metadata;
+  `FormatDetector::detect_with_metadata`, `AudioMetadata::format_only`, and
+  `AudioMetadata::with_properties`
+  are removed.
+- Decoding no longer copies the input buffer.
 - **Breaking:** `DcHighPassFilter::process` takes `Option<VadContext>` by
   value, like `NoiseReducer::reduce`.
 - **Breaking:** configuration validation errors are `Error::Configuration`
@@ -77,8 +86,9 @@ uses [Semantic Versioning](https://semver.org/).
   `Error::InvalidInput` instead of unwinding into the caller.
 - `NoiseReductionConfig::validate` rejects a hop shorter than one sample,
   which made `reduce` loop forever.
-- `FormatDetector::detect_with_metadata` picks the same track as the
-  decoder and recognizes every PCM variant (mu-law, A-law, big-endian).
+- Symphonia 0.6 fixes an untrusted allocation in the MP4 reader: a 5 KB
+  M4A with a corrupt sample table could make 0.5 try to allocate 32 GB and
+  abort the process (found by fuzzing).
 - `LICENSE-APACHE` now contains the full license text.
 
 ### Removed

@@ -23,7 +23,7 @@ include = [
 ]
 
 [dependencies]
-symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+symphonia = { version = "0.6", default-features = false, features = ["aac", "adpcm", "alac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav", "aiff", "caf"] }
 realfft = "3.5"
 tracing = "0.1"
 thiserror = "2"

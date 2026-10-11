@@ -6,7 +6,7 @@
 //!
 //! | Stage | Type |
 //! |-------|------|
-//! | Decode WAV, FLAC, MP3, AAC/M4A, Ogg Vorbis to 16 kHz mono | [`converter::AudioFormatConverter`] |
+//! | Decode WAV, AIFF, FLAC, ALAC, MP3, AAC, Vorbis to 16 kHz mono | [`converter::AudioFormatConverter`] |
 //! | Voice activity detection | [`VadDetector`] |
 //! | Speech-aligned chunking with overlap | [`Chunker`] |
 //! | DC removal and high-pass filter | [`preprocessing::DcHighPassFilter`] |

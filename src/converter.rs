@@ -4,9 +4,9 @@
 //! bytes ─► detect format ─► decode (Symphonia) ─► mix to mono ─► resample to 16 kHz
 //! ```
 //!
-//! Supported inputs: WAV (8/16/24/32-bit integer and 32/64-bit float PCM),
-//! FLAC, MP3, AAC in MP4/M4A, and Vorbis in Ogg or WebM. Opus is detected
-//! but rejected with [`Error::Unsupported`].
+//! Supported inputs: PCM (any bit depth, float, mu-law, A-law) and ADPCM in
+//! WAV, AIFF, or CAF; FLAC; ALAC; MP3; AAC-LC in MP4/M4A; Vorbis in Ogg or
+//! WebM. Opus is detected but rejected with [`Error::Unsupported`].
 //!
 //! Any channel count is accepted and averaged to mono. Resampling uses a
 //! windowed-sinc filter that passes up to 7.2 kHz and removes content above
@@ -16,8 +16,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::decoder::{self, ChannelMixer, SampleRateConverter};
-use crate::error::{Error, Result};
-use crate::format::{AudioFormat, FormatDetector};
+#[cfg(doc)]
+use crate::error::Error;
+use crate::error::Result;
+use crate::format::AudioFormat;
 use crate::time::AudioInstant;
 
 /// Sample rate of [`StandardAudio`].
@@ -111,14 +113,26 @@ impl AudioFormatConverter {
     /// - [`Error::Unsupported`] if the format is recognized but cannot be
     ///   decoded (Opus, or an unsupported codec inside a container).
     pub fn convert_to_standard(audio_bytes: &[u8]) -> Result<StandardAudio> {
+        Self::convert(audio_bytes, None)
+    }
+
+    /// Read and decode an audio file from disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be read, otherwise the same as
+    /// [`convert_to_standard`](Self::convert_to_standard).
+    pub fn convert_file(path: impl AsRef<Path>) -> Result<StandardAudio> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)?;
+        Self::convert(&bytes, path.extension().and_then(|ext| ext.to_str()))
+    }
+
+    fn convert(audio_bytes: &[u8], extension: Option<&str>) -> Result<StandardAudio> {
         let start = AudioInstant::now();
 
-        let format = FormatDetector::detect(audio_bytes)?.format;
-        if format == AudioFormat::Opus {
-            return Err(Error::Unsupported("Opus decoding is not available".into()));
-        }
-
-        let decoded = decoder::decode(audio_bytes, Some(format.extension()))?;
+        let decoded = decoder::decode(audio_bytes, extension)?;
+        let format = decoded.format;
         let peak_before = peak(&decoded.samples);
 
         let mono = ChannelMixer::mix_to_mono(&decoded.samples, decoded.channels)?;
@@ -145,17 +159,6 @@ impl AudioFormatConverter {
 
         Ok(StandardAudio { samples, metadata })
     }
-
-    /// Read and decode an audio file from disk.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Io`] if the file cannot be read, otherwise the same as
-    /// [`convert_to_standard`](Self::convert_to_standard).
-    pub fn convert_file(path: impl AsRef<Path>) -> Result<StandardAudio> {
-        let bytes = std::fs::read(path)?;
-        Self::convert_to_standard(&bytes)
-    }
 }
 
 fn peak(samples: &[f32]) -> f32 {
@@ -165,6 +168,7 @@ fn peak(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     fn wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
         let spec = hound::WavSpec {
