@@ -20,6 +20,9 @@ uses [Semantic Versioning](https://semver.org/).
 - `VadDetector::with_metrics` for attaching a metrics collector.
 - `Pipeline::with_max_speech_hold` (default 2 s): long uninterrupted speech
   is emitted in chunks while it is still going instead of after it ends.
+- `ProcessedChunk::samples_with_context`: the previous chunk's tail followed
+  by this chunk's samples. In the pipeline, the context also carries across
+  `process_samples` calls.
 - `VadDetector::flush` to analyze the last partial frame and close a segment
   that runs to the end of the stream.
 - `Error::Unsupported` for recognized but undecodable formats (Opus).
@@ -116,6 +119,8 @@ uses [Semantic Versioning](https://semver.org/).
 - **Breaking:** `buffer::AudioBuffer`, `types::AudioChunk`, the `fixtures`
   feature and `fixtures` module, `Chunker::default()` as an inherent method
   (use `Default`), `ProcessedChunk::samples_without_overlap`,
+  `ProcessedChunk::overlap_next` (it duplicated the next chunk's
+  `overlap_prev`), `ProcessedChunk::total_samples_with_overlap`,
   `ConversionMetadata::has_performance_issue`,
   `AudioFormat::is_container_format`, `ProcessingResult::backpressure_active`,
   and `StageLatencies::broadcasting_avg`.

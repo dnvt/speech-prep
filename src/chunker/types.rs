@@ -51,16 +51,13 @@ pub struct ProcessedChunk {
     /// recording clipped.
     pub has_clipping: bool,
 
-    /// Last `overlap_duration` of the previous chunk, for models that need
-    /// left context. `None` for the first chunk of a stream.
+    /// The last `overlap_duration` of the previous chunk, for models that
+    /// need left context across chunk boundaries. `None` for the first chunk
+    /// of a stream. See [`samples_with_context`](Self::samples_with_context).
     pub overlap_prev: Option<Vec<f32>>,
 
-    /// Last `overlap_duration` of this chunk, i.e. the next chunk's
-    /// `overlap_prev`. `None` for the last chunk of a call.
-    pub overlap_next: Option<Vec<f32>>,
-
-    /// Length of the overlap vectors in milliseconds. Can be shorter than
-    /// configured next to very short chunks.
+    /// Length of `overlap_prev` in milliseconds. Can be shorter than
+    /// configured when the previous chunk is very short.
     pub overlap_ms: u32,
 }
 
@@ -91,15 +88,19 @@ impl ProcessedChunk {
         self.start_boundary == ChunkBoundary::Silence && self.end_boundary == ChunkBoundary::Silence
     }
 
-    /// Returns total sample count including overlap regions.
-    ///
-    /// Useful for buffer allocation when reconstructing the full audio data
-    /// with prepended/appended overlaps.
+    /// `overlap_prev` followed by `samples`: the chunk with its left
+    /// context, ready to feed a model that needs it.
     #[must_use]
-    pub fn total_samples_with_overlap(&self) -> usize {
-        let prev_overlap = self.overlap_prev.as_ref().map_or(0, Vec::len);
-        let next_overlap = self.overlap_next.as_ref().map_or(0, Vec::len);
+    pub fn samples_with_context(&self) -> Vec<f32> {
+        let context = self.overlap_prev.as_deref().unwrap_or_default();
+        [context, &self.samples].concat()
+    }
 
-        self.samples.len() + prev_overlap + next_overlap
+    /// Set `overlap_prev` and keep `overlap_ms` consistent with it.
+    pub(crate) fn set_overlap_prev(&mut self, overlap: Option<Vec<f32>>, sample_rate: u32) {
+        let len = overlap.as_ref().map_or(0, Vec::len) as u64;
+        let rate = u64::from(sample_rate.max(1));
+        self.overlap_ms = ((len * 1000 + rate / 2) / rate) as u32;
+        self.overlap_prev = overlap;
     }
 }
