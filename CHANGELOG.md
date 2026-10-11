@@ -36,6 +36,9 @@ uses [Semantic Versioning](https://semver.org/).
 - The default VAD energy gate is 10x lower (0.002 instead of 0.02). The old
   value ignored voiced audio peaking at -20 dBFS.
 - Channels are mixed to mono before resampling instead of after.
+- Resampling uses a Kaiser-windowed sinc filter instead of linear
+  interpolation. A 12 kHz tone at 48 kHz used to alias to 4 kHz at full
+  level; it is now attenuated by about 100 dB.
 - Edition 2024. Cargo now resolves dependencies against `rust-version`, so
   1.87 builds without pinning anything.
 - Library code no longer logs at `info`/`warn` on every call or warns when a

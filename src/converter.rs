@@ -8,8 +8,9 @@
 //! FLAC, MP3, AAC in MP4/M4A, and Vorbis in Ogg or WebM. Opus is detected
 //! but rejected with [`Error::Unsupported`].
 //!
-//! Any channel count is accepted and averaged to mono. Resampling uses linear
-//! interpolation without an anti-aliasing filter; see the README for details.
+//! Any channel count is accepted and averaged to mono. Resampling uses a
+//! windowed-sinc filter that passes up to 7.2 kHz and removes content above
+//! 8 kHz instead of letting it alias.
 
 use std::path::Path;
 use std::time::Duration;
