@@ -6,7 +6,8 @@
 //!
 //! Supported inputs: PCM (any bit depth, float, mu-law, A-law) and ADPCM in
 //! WAV, AIFF, or CAF; FLAC; ALAC; MP3; AAC-LC in MP4/M4A; Vorbis in Ogg or
-//! WebM. Opus is detected but rejected with [`Error::Unsupported`].
+//! WebM; and, with the `opus` feature, Opus in Ogg or WebM. Without the
+//! feature, Opus input is rejected with [`Error::Unsupported`].
 //!
 //! Any channel count is accepted and averaged to mono. Resampling uses a
 //! windowed-sinc filter that passes up to 7.2 kHz and removes content above
@@ -115,7 +116,8 @@ impl AudioFormatConverter {
     /// - [`Error::InvalidInput`] if the bytes are not recognizable or are
     ///   corrupt.
     /// - [`Error::Unsupported`] if the format is recognized but cannot be
-    ///   decoded (Opus, or an unsupported codec inside a container).
+    ///   decoded (Opus without the `opus` feature, or an unknown codec inside
+    ///   a container).
     pub fn convert_to_standard(audio_bytes: &[u8]) -> Result<StandardAudio> {
         Self::convert(audio_bytes, None)
     }

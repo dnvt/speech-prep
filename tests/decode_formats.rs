@@ -82,9 +82,35 @@ fn adpcm_in_wav() {
 }
 
 #[test]
-fn opus_is_reported_as_unsupported() {
+#[cfg(not(feature = "opus"))]
+fn opus_needs_the_feature() {
     let err = AudioFormatConverter::convert_file(fixture("tone.opus")).unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::Unsupported(ref msg) if msg.contains("opus")),
+        "{err:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "opus")]
+fn opus_in_ogg() {
+    // Opus always decodes at 48 kHz, whatever the encoder input rate was.
+    let audio = AudioFormatConverter::convert_file(fixture("tone.opus")).unwrap();
+    assert_eq!(audio.metadata.original_format, AudioFormat::Opus);
+    assert_eq!(audio.metadata.original_sample_rate, 48_000);
+    assert_eq!(audio.metadata.original_channels, 2);
+    assert!((0.45..0.6).contains(&audio.duration_sec()));
+    assert!(!audio.is_silent());
+}
+
+#[test]
+#[cfg(feature = "opus")]
+fn opus_in_webm() {
+    let audio = AudioFormatConverter::convert_file(fixture("tone-opus.webm")).unwrap();
+    assert_eq!(audio.metadata.original_format, AudioFormat::Opus);
+    assert_eq!(audio.metadata.original_channels, 1);
+    assert!((0.18..0.3).contains(&audio.duration_sec()));
+    assert!(!audio.is_silent());
 }
 
 #[test]
