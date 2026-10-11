@@ -89,10 +89,9 @@ channel count is averaged to mono.
 
 ## Limitations
 
-- **Resampling** is linear interpolation with no anti-aliasing filter. That
-  is fine for speech recorded at 44.1/48 kHz, but use a dedicated resampler
-  such as [`rubato`](https://crates.io/crates/rubato) and feed the pipeline
-  16 kHz samples if you need a clean high band.
+- **Resampling** uses a windowed-sinc low-pass filter. Content between
+  7.2 and 8 kHz is rolled off and everything above 8 kHz is removed, so the
+  16 kHz output keeps the speech band but not the top of the spectrum.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
   (`activation_margin`, `min_speech_energy`, `hangover_frames`).
