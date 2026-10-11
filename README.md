@@ -103,12 +103,13 @@ accepted.
 
 ## Limitations
 
-- **Resampling** uses a windowed-sinc low-pass filter. For inputs at 16 kHz
-  or above, the response is flat to about 6.6 kHz and rolls off from there
+- **Resampling** uses a windowed-sinc low-pass filter. For inputs above 16 kHz,
+  the response is flat to about 6.6 kHz and rolls off from there
   (about -3 dB at 7.1 kHz, -6 dB at 7.2 kHz), with everything near and above
   the 8 kHz output Nyquist strongly attenuated. The 16 kHz output keeps the
-  speech band but not the top of the spectrum. Lower-rate inputs are
-  band-limited at 90% of their own Nyquist frequency.
+  speech band but not the top of the spectrum. Inputs already at 16 kHz
+  pass through without filtering. Lower-rate inputs are band-limited at
+  90% of their own Nyquist frequency.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
   (`activation_ratio`, `hangover_frames`, `speech_padding`).

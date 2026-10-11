@@ -10,10 +10,11 @@
 //! feature, Opus input is rejected with [`Error::Unsupported`].
 //!
 //! Any channel count is accepted and averaged to mono. Resampling uses a
-//! windowed-sinc filter. For inputs at 16 kHz or above it is flat to about
+//! windowed-sinc filter. For inputs above 16 kHz it is flat to about
 //! 6.6 kHz and rolls off above it (-6 dB near 7.2 kHz), strongly attenuating
 //! content near and above the 8 kHz output Nyquist instead of letting it alias.
-//! Lower-rate inputs are band-limited at 90% of their own Nyquist frequency.
+//! Inputs already at 16 kHz pass through without filtering. Lower-rate inputs
+//! are band-limited at 90% of their own Nyquist frequency.
 
 use std::path::Path;
 use std::time::Duration;
