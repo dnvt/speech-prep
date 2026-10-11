@@ -47,8 +47,8 @@ uses [Semantic Versioning](https://semver.org/).
   value, like `NoiseReducer::reduce`.
 - **Breaking:** configuration validation errors are `Error::Configuration`
   everywhere; `Error` is `#[non_exhaustive]`.
-- The VAD noise baselines are seeded from the first frames and track the
-  noise floor during speech too. Before, a recording that started with
+- The VAD noise baselines are seeded from the quietest frame of the first
+  300 ms and track the noise floor during speech too. Before, a recording that started with
   noise above the energy gate was classified as one long speech segment.
 - With that fixed, the default VAD energy gate is 40x lower (0.0005 instead
   of 0.02). The old value missed 60% of speech peaking at -6 dBFS and all
@@ -88,6 +88,9 @@ uses [Semantic Versioning](https://semver.org/).
 - A panic inside Symphonia on malformed input (found by fuzzing: a
   Matroska element with a zero length byte) is returned as
   `Error::InvalidInput` instead of unwinding into the caller.
+- `StandardAudio` samples are now guaranteed finite and within `[-1, 1]`:
+  NaN or infinite input is an error, and louder-than-full-scale float input
+  or resampler overshoot is clamped.
 - Inputs declaring a sample rate outside 4-768 kHz are rejected with
   `Error::Unsupported`. Fuzzing found a 10 KB file claiming 1.04 GHz that
   made the resampler build a 1.7 GB filter and run for 40 s.
