@@ -95,10 +95,14 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
         let packet = match reader.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
+            // Symphonia 0.6 signals a clean end with `Ok(None)`; an
+            // unexpected EOF means the stream was cut mid-packet. Treat a
+            // truncated stream as invalid rather than returning the partial
+            // audio decoded so far as `Ok`.
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                break;
+                return Err(Error::InvalidInput("audio stream is truncated".into()));
             }
             // A new logical stream started (e.g. chained Ogg). Reopen it and
             // carry on if it has the same layout.
@@ -144,6 +148,15 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
 
         decoded.copy_to_vec_interleaved(&mut block);
         samples.extend_from_slice(&block);
+
+        // Guard against a decompression bomb: a tiny compressed file can
+        // declare hours of audio and decode to gigabytes. Check incrementally
+        // so the allocation is bounded, not only after the whole decode.
+        if samples.len() > MAX_DECODED_SAMPLES {
+            return Err(Error::InvalidInput(format!(
+                "decoded audio exceeds the {MAX_DECODED_SAMPLES} interleaved-sample limit"
+            )));
+        }
     }
 
     // Tolerate the odd corrupt frame, but not a stream that mostly fails.
@@ -176,6 +189,13 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
 
 /// More than 1 in this many packets failing to decode is an error.
 const MAX_SKIPPED_DENOMINATOR: usize = 10;
+
+/// Upper bound on interleaved samples a single decode may buffer, as a defence
+/// against decompression bombs (a tiny compressed file declaring hours of
+/// audio). 64 Mi f32 samples is 256 MiB: about 66 minutes of 16 kHz mono or
+/// 11 minutes of 48 kHz stereo, well beyond any real speech clip while
+/// refusing multi-gigabyte blow-ups. Longer material should be chunked.
+const MAX_DECODED_SAMPLES: usize = 64 * 1024 * 1024;
 
 /// The first track with audio codec parameters.
 pub(crate) fn first_audio_track(reader: &dyn FormatReader) -> Option<(u32, &AudioCodecParameters)> {
