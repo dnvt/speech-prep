@@ -383,11 +383,7 @@ impl Pipeline {
         );
         apply_overlaps(&mut chunks, overlap, STANDARD_SAMPLE_RATE);
         if let Some(first) = chunks.first_mut() {
-            first.overlap_prev = self.last_tail.take();
-            if first.overlap_next.is_none() {
-                let len = first.overlap_prev.as_ref().map_or(0, Vec::len);
-                first.overlap_ms = (len as u64 * 1000 / u64::from(STANDARD_SAMPLE_RATE)) as u32;
-            }
+            first.set_overlap_prev(self.last_tail.take(), STANDARD_SAMPLE_RATE);
         }
         self.last_tail = chunks.last().map(|last| {
             let from = last.samples.len().saturating_sub(overlap);
@@ -639,16 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn overlap_ms_matches_overlap_vectors() {
+    fn context_is_the_previous_chunks_tail_across_calls() {
         let audio = burst(0.5, 1.0, 0.5);
         for block in [1_600, 4_000] {
-            for chunk in run_streamed(&audio, block) {
-                let len = chunk
-                    .overlap_next
-                    .as_ref()
-                    .or(chunk.overlap_prev.as_ref())
-                    .map_or(0, Vec::len);
-                assert_eq!(chunk.overlap_ms as usize, len * 1000 / SR, "{chunk:?}");
+            let chunks = run_streamed(&audio, block);
+            assert!(chunks[0].overlap_prev.is_none());
+            for pair in chunks.windows(2) {
+                let context = pair[1].overlap_prev.as_ref().expect("context");
+                let prev = &pair[0].samples;
+                assert_eq!(context[..], prev[prev.len() - context.len()..]);
+                assert_eq!(
+                    pair[1].overlap_ms as usize,
+                    (context.len() * 1000 + SR / 2) / SR
+                );
             }
         }
     }

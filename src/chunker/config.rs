@@ -33,7 +33,7 @@ pub struct ChunkerConfig {
 
     /// Duration of overlap between adjacent chunks (default: 50ms).
     ///
-    /// Copied into `ProcessedChunk::overlap_prev` / `overlap_next`.
+    /// Copied into `ProcessedChunk::overlap_prev`.
     /// [`new`](Self::new) accepts 20-80 ms.
     pub overlap_duration: Duration,
 }

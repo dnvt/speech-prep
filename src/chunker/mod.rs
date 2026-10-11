@@ -13,8 +13,8 @@
 //! into pieces close to `target_duration` (never longer than
 //! `max_duration`), and short tails are merged into the previous piece.
 //! Every chunk gets energy, speech ratio, SNR (when a noise baseline is
-//! available), and a copy of the neighbouring samples in `overlap_prev` /
-//! `overlap_next` for models that need context across boundaries.
+//! available), and a copy of the end of the previous chunk in
+//! `overlap_prev` for models that need context across boundaries.
 //!
 //! ```
 //! use speech_prep::time::{AudioDuration, AudioTimestamp};
@@ -34,8 +34,8 @@
 //!
 //! let chunks = chunker.chunk(&audio, 16_000, &[speech])?;
 //! assert_eq!(chunks.len(), 2);
-//! assert!(chunks[0].overlap_next.is_some());
-//! assert!(chunks[1].overlap_prev.is_some());
+//! assert!(chunks[0].overlap_prev.is_none());
+//! assert_eq!(chunks[1].overlap_ms, 50);
 //! # Ok(())
 //! # }
 //! ```
