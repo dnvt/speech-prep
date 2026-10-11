@@ -40,6 +40,21 @@ uses [Semantic Versioning](https://semver.org/).
   a count. `process_frame` is now `process_bytes`.
 - **Breaking:** `VadDetector::new` takes only a `VadConfig`.
 - **Breaking:** `VADStats` is now `vad::VadStats`.
+- **Breaking:** the VAD decides on frame energy relative to a tracked noise
+  floor and nothing else. The spectral-flux score, combined threshold and
+  their settings never changed a decision once the relative energy gate was
+  in place, so they are gone: `VadConfig` loses `energy_smoothing`
+  (now `noise_smoothing`), `flux_smoothing`, `flux_floor`,
+  `threshold_smoothing`, `activation_margin`, `release_margin`,
+  `base_threshold`, `energy_weight`, `flux_weight` and `fft_size()`, and
+  gains `activation_ratio` (default 2.5) and `release_ratio` (default 1.3).
+  The hysteresis between them raises F1 on real speech from 0.946 to 0.958
+  and splits speech in heavy noise into fewer pieces.
+  `VadMetricsSnapshot::adaptive` and `AdaptiveThresholdSnapshot` are
+  replaced by `VadMetricsSnapshot::noise_floor`.
+- `SpeechChunk::confidence` is now how far the segment's speech rises above
+  the noise floor (0 at the floor, 1 at 20 dB above). It used to be 1.0 for
+  almost every segment.
 - **Breaking:** `ConversionMetadata` reports a single `conversion_time` and
   `original_channels` is a `u16`.
 - Opus input without the `opus` feature is `Error::Unsupported` with a
@@ -56,7 +71,7 @@ uses [Semantic Versioning](https://semver.org/).
   value, like `NoiseReducer::reduce`.
 - **Breaking:** configuration validation errors are `Error::Configuration`
   everywhere; `Error` is `#[non_exhaustive]`.
-- The VAD noise baselines are seeded from the quietest frame of the first
+- The VAD noise floor is seeded from the quietest frame of the first
   300 ms and track the noise floor during speech too. Before, a recording that started with
   noise above the energy gate was classified as one long speech segment.
 - The default `hangover_frames` is 20 (200 ms) instead of 3 (30 ms; the
@@ -84,6 +99,9 @@ uses [Semantic Versioning](https://semver.org/).
 
 - The pipeline no longer emits the start of a speech segment that is still
   in progress as a silence chunk.
+- Pipeline speech chunks emitted from a window with no silence of its own
+  (long speech held past `max_speech_hold`, or the end of a stream) had no
+  `snr_db`. They now use the level of the last silence in the stream.
 - `NoiseReducer` no longer fades each chunk in from near zero at its first
   samples (about -23 dB on a steady tone with 500 ms chunks).
 - The fourth-order high-pass filter now has Butterworth stage Q values; the
@@ -92,7 +110,7 @@ uses [Semantic Versioning](https://semver.org/).
   `silence_frames` was always zero.
 - `QualityMetrics::spectral_centroid` is now computed from the spectrum. It
   used to be a weighted time index, not a frequency.
-- `VadDetector::reset` now also resets the adaptive baselines.
+- `VadDetector::reset` now also resets the noise floor.
 - `VadDetector::detect` keeps samples that don't fill a frame for the next
   call. Before, each call started a new frame grid, so blocks under about 64
   samples never detected speech.
