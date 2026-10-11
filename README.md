@@ -124,5 +124,4 @@ To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT](LICENSE-MIT), at your option.
+[MIT](LICENSE)

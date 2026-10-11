@@ -96,9 +96,10 @@ uses [Semantic Versioning](https://semver.org/).
 - Symphonia 0.6 fixes an untrusted allocation in the MP4 reader: a 5 KB
   M4A with a corrupt sample table could make 0.5 try to allocate 32 GB and
   abort the process (found by fuzzing).
-- `LICENSE-APACHE` now contains the full license text.
 
 ### Removed
+
+- **Licensing:** the crate is now MIT only (0.1.x was MIT OR Apache-2.0).
 
 - **Breaking:** `buffer::AudioBuffer`, `types::AudioChunk`, the `fixtures`
   feature and `fixtures` module, `Chunker::default()` as an inherent method
