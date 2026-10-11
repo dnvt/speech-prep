@@ -16,7 +16,7 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// // Noisy room: require a stronger signal and tolerate longer pauses.
 /// let noisy = VadConfig {
 ///     activation_margin: 1.4,
-///     hangover_frames: 5,
+///     hangover_frames: 25,
 ///     ..VadConfig::default()
 /// };
 /// assert!(noisy.validate().is_ok());
@@ -101,8 +101,15 @@ pub struct VadConfig {
     pub flux_weight: f32,
 
     /// Silent frames tolerated before a speech segment is closed.
-    /// Default: 3 (60 ms with the default frame settings).
+    /// Default: 20 (200 ms with the default 10 ms hop), which keeps the
+    /// short gaps between words inside one segment. Lower it to split speech
+    /// at every brief pause.
     pub hangover_frames: usize,
+
+    /// Extra audio included before and after each segment, so soft word
+    /// onsets and endings are not cut off. Default: 50 ms. Padding never
+    /// makes segments overlap.
+    pub speech_padding: AudioDuration,
 
     /// Minimum number of speech frames for a segment to be reported.
     /// Default: 3. Shorter blips are dropped.
@@ -134,7 +141,8 @@ impl Default for VadConfig {
             base_threshold: 0.4,
             energy_weight: 0.6,
             flux_weight: 0.4,
-            hangover_frames: 3,
+            hangover_frames: 20,
+            speech_padding: AudioDuration::from_millis(50),
             min_speech_frames: 3,
             stream_start_time: AudioTimestamp::EPOCH,
             pre_emphasis: Some(0.97),

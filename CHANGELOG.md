@@ -50,6 +50,15 @@ uses [Semantic Versioning](https://semver.org/).
 - The VAD noise baselines are seeded from the quietest frame of the first
   300 ms and track the noise floor during speech too. Before, a recording that started with
   noise above the energy gate was classified as one long speech segment.
+- The default `hangover_frames` is 20 (200 ms) instead of 3 (30 ms; the
+  docs said 60 ms), and hangover frames no longer extend a segment's end.
+  Segments get 50 ms of padding on each side (`VadConfig::speech_padding`,
+  new). On real speech in three languages, scored against Silero VAD and a
+  human annotation, a sentence is no longer split at every gap between
+  words (e.g. 6 segments instead of 56 on a 30 s meeting clip) and F1 goes
+  from 0.89 to 0.95.
+- `VadStats::speech_frames` counts frames that measured as speech; hangover
+  frames now count as silence.
 - With that fixed, the default VAD energy gate is 40x lower (0.0005 instead
   of 0.02). The old value missed 60% of speech peaking at -6 dBFS and all
   speech at -20 dBFS in a synthesized test set.

@@ -288,9 +288,11 @@ impl Pipeline {
         if analyzed.saturating_sub(self.pending_start) <= self.max_hold {
             return Ok(Vec::new());
         }
-        let Some(seg_start) = self.vad.active_segment_start_sample() else {
+        if self.vad.active_segment_start_sample().is_none() {
             return Ok(Vec::new());
-        };
+        }
+        // Padded start of the open segment.
+        let seg_start = self.vad.undecided_from();
 
         let target = Chunker::duration_to_samples(
             self.chunker.config().target_duration,
@@ -420,7 +422,10 @@ mod tests {
 
     const SR: usize = 16_000;
 
-    /// `lead` s of silence, `tone` s of 1 kHz, `tail` s of silence.
+    /// `lead` s of silence, `tone` s of speech-like sound, `tail` s of
+    /// silence. The "speech" is 150 Hz voiced harmonics with 10 dB syllable
+    /// dips at 4 Hz; a steady tone would be absorbed into the background
+    /// after a few seconds, as any stationary sound is.
     fn burst(lead: f32, tone: f32, tail: f32) -> Vec<f32> {
         let (lead, tone, tail) = (
             (lead * SR as f32) as usize,
@@ -429,7 +434,13 @@ mod tests {
         );
         let mut audio = vec![0.0f32; lead + tone + tail];
         for (i, s) in audio[lead..lead + tone].iter_mut().enumerate() {
-            *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
+            let t = i as f32 / SR as f32;
+            let phase = 2.0 * std::f32::consts::PI * 4.0 * t;
+            let envelope = 0.684f32.mul_add(0.5f32.mul_add(-phase.cos(), 0.5), 0.316);
+            let voiced: f32 = (1..=15)
+                .map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32)
+                .sum();
+            *s = 0.3 * envelope * voiced;
         }
         audio
     }
