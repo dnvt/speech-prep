@@ -16,10 +16,11 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// before any frame is classified.
 const WARMUP: AudioDuration = AudioDuration::from_millis(300);
 
-/// Per-frame factor for raising the noise floor during speech. With the
-/// default 10 ms hop the floor needs a few seconds of sustained level to
-/// rise, while words and syllables only nudge it.
-const SPEECH_FLOOR_RISE: f32 = 0.998;
+/// Time constant for raising the noise floor during speech: the floor needs
+/// a few seconds of sustained level to rise, while words and syllables only
+/// nudge it. Applied per frame as `exp(-hop / tau)`, so it means the same
+/// time at any hop (0.998 per frame at the default 10 ms hop).
+const SPEECH_FLOOR_RISE_TAU_SECS: f64 = 5.0;
 
 /// Streaming voice activity detector. See the [module docs](super) for an
 /// example and [`VadConfig`] for tuning.
@@ -29,6 +30,9 @@ pub struct VadDetector {
     metrics: Arc<dyn VadMetricsCollector>,
     /// Frames buffered at the start of a stream to estimate the background.
     warmup_frames: usize,
+    /// Per-frame smoothing for raising the noise floor during speech,
+    /// derived from [`SPEECH_FLOOR_RISE_TAU_SECS`] and the hop.
+    speech_floor_rise: f32,
     /// `speech_padding` in samples.
     padding_samples: usize,
     state: Mutex<DetectorState>,
@@ -66,6 +70,7 @@ impl VadDetector {
         let window = hann_window(config.frame_length_samples()?);
         let hop_secs = config.hop_length_samples()? as f64 / f64::from(config.sample_rate);
         let warmup_frames = (WARMUP.as_secs_f64() / hop_secs).ceil().max(1.0) as usize;
+        let speech_floor_rise = (-hop_secs / SPEECH_FLOOR_RISE_TAU_SECS).exp() as f32;
         let padding_samples =
             (config.speech_padding.as_secs_f64() * f64::from(config.sample_rate)).round() as usize;
 
@@ -75,6 +80,7 @@ impl VadDetector {
             window,
             metrics,
             warmup_frames,
+            speech_floor_rise,
             padding_samples,
         })
     }
@@ -367,7 +373,7 @@ impl VadDetector {
             // first frame and the floor never adapts.
             let floor = state.noise_floor;
             let weight = if in_speech && frame.energy > floor {
-                SPEECH_FLOOR_RISE
+                self.speech_floor_rise
             } else {
                 smoothing
             };
@@ -815,6 +821,96 @@ mod tests {
             .sum();
         assert!(segments[0].start_time.as_secs() < 0.05, "{segments:?}");
         assert!(speech > 1.8, "only {speech:.2} s detected: {segments:?}");
+    }
+
+    /// 2 s of voiced harmonics with 10 dB syllable dips at 4 Hz, starting on a
+    /// loud peak (no lead-in silence), then 1 s of silence.
+    fn mid_speech_signal() -> Vec<f32> {
+        let mut audio: Vec<f32> = (0..SR * 2)
+            .map(|i| {
+                let t = i as f32 / SR as f32;
+                let phase = 2.0 * std::f32::consts::PI * 4.0 * t;
+                let envelope = 0.684f32.mul_add(0.5f32.mul_add(phase.cos(), 0.5), 0.316);
+                let voiced: f32 = (1..=15)
+                    .map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32)
+                    .sum();
+                0.3 * envelope * voiced
+            })
+            .collect();
+        audio.extend(vec![0.0; SR]);
+        audio
+    }
+
+    fn total_speech(segments: &[SpeechChunk]) -> f64 {
+        segments
+            .iter()
+            .map(|s| s.end_time.as_secs() - s.start_time.as_secs())
+            .sum()
+    }
+
+    fn detect_in_blocks(config: VadConfig, audio: &[f32], block: usize) -> Vec<SpeechChunk> {
+        let detector = VadDetector::new(config).unwrap();
+        let mut segments = Vec::new();
+        for chunk in audio.chunks(block) {
+            segments.extend(detector.detect(chunk).unwrap());
+        }
+        segments.extend(detector.flush().unwrap());
+        segments
+    }
+
+    #[test]
+    fn block_size_does_not_change_detection() {
+        // A stream that begins mid-utterance, fed in blocks smaller than a
+        // frame and in odd sizes: warm-up and framing carry across calls, so
+        // the result matches one call on the whole clip.
+        let audio = mid_speech_signal();
+        let whole = detect_in_blocks(VadConfig::default(), &audio, audio.len());
+        assert!(whole[0].start_time.as_secs() < 0.05, "{whole:?}");
+        for block in [4096, 160, 37] {
+            let streamed = detect_in_blocks(VadConfig::default(), &audio, block);
+            assert!(
+                (total_speech(&whole) - total_speech(&streamed)).abs() < 0.02,
+                "block {block}: one call {:.3} s vs streamed {:.3} s",
+                total_speech(&whole),
+                total_speech(&streamed)
+            );
+        }
+    }
+
+    #[test]
+    fn noise_floor_rise_does_not_depend_on_hop() {
+        // A steady 1 kHz tone after a quiet lead-in is speech at first; the
+        // floor then rises towards it until the tone is absorbed. How long
+        // that takes is a time, so it must not change with the frame hop.
+        let mut seed = 1u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let audio: Vec<f32> = (0..SR * 14)
+            .map(|i| {
+                let tone = if i >= SR / 2 {
+                    0.1 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).sin()
+                } else {
+                    0.0
+                };
+                tone + 0.002 * noise()
+            })
+            .collect();
+
+        let absorbed_after = |frame_overlap: f32| {
+            let config = VadConfig {
+                frame_overlap,
+                ..VadConfig::default()
+            };
+            let segments = detect_in_blocks(config, &audio, audio.len());
+            segments[0].end_time.as_secs() - segments[0].start_time.as_secs()
+        };
+        let (hop_10ms, hop_5ms) = (absorbed_after(0.5), absorbed_after(0.75));
+        assert!(
+            (hop_10ms - hop_5ms).abs() < 0.5,
+            "tone absorbed after {hop_10ms:.2} s at a 10 ms hop but {hop_5ms:.2} s at 5 ms"
+        );
     }
 
     #[test]
