@@ -94,6 +94,13 @@ impl NoiseReductionConfig {
             )));
         }
 
+        if self.hop_length() == 0 {
+            return Err(Error::Configuration(format!(
+                "hop_ms {:.3} is shorter than one sample at {} Hz",
+                self.hop_ms, self.sample_rate_hz
+            )));
+        }
+
         if !(1.0..=3.0).contains(&self.oversubtraction_factor) {
             return Err(Error::Configuration(format!(
                 "oversubtraction_factor {:.2} must be in 1.0-3.0",
@@ -436,6 +443,13 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid_smoothing.validate().is_err());
+
+        let hop_below_one_sample = NoiseReductionConfig {
+            sample_rate_hz: 8000,
+            hop_ms: 0.05,
+            ..Default::default()
+        };
+        assert!(hop_below_one_sample.validate().is_err());
 
         Ok(())
     }

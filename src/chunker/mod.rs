@@ -122,24 +122,26 @@ impl Chunker {
             }
         }
 
+        let segments = merge_segments(vad_segments);
+
         let total_samples = audio.len();
         let total_duration_secs = total_samples as f64 / f64::from(sample_rate);
         let total_duration = Duration::from_secs_f64(total_duration_secs);
 
-        let earliest_segment_start = vad_segments.iter().map(|seg| seg.start_time).min();
+        let earliest_segment_start = segments.iter().map(|seg| seg.start_time).min();
         let audio_start = earliest_segment_start.map_or(stream_start_time, |start| {
             std::cmp::min(start, stream_start_time)
         });
 
         let noise_baseline =
-            Self::compute_noise_baseline(audio, sample_rate, vad_segments, audio_start);
+            Self::compute_noise_baseline(audio, sample_rate, &segments, audio_start);
 
         let estimated_chunks =
             (total_duration.as_millis() / self.config.target_duration.as_millis()).max(1) as usize
                 + 1;
         let mut chunks = Vec::with_capacity(estimated_chunks);
 
-        if vad_segments.is_empty() {
+        if segments.is_empty() {
             chunks.push(Self::create_silence_chunk(
                 audio,
                 sample_rate,
@@ -150,7 +152,7 @@ impl Chunker {
         } else {
             let mut current_time = audio_start;
 
-            for segment in vad_segments {
+            for segment in &segments {
                 if segment.start_time > current_time {
                     let silence_end = segment.start_time;
                     let silence_duration =
@@ -203,3 +205,26 @@ impl Chunker {
 
 #[cfg(test)]
 mod tests;
+
+/// Sort segments by start time and merge any that overlap, so the chunker
+/// never emits the same audio twice.
+fn merge_segments(segments: &[SpeechChunk]) -> Vec<SpeechChunk> {
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|seg| seg.start_time);
+
+    let mut merged: Vec<SpeechChunk> = Vec::with_capacity(sorted.len());
+    for seg in sorted {
+        match merged.last_mut() {
+            Some(prev) if seg.start_time < prev.end_time => {
+                let frames = prev.frame_count + seg.frame_count;
+                let weight = |s: &SpeechChunk| s.frame_count as f32 / frames.max(1) as f32;
+                prev.confidence = prev.confidence * weight(prev) + seg.confidence * weight(&seg);
+                prev.avg_energy = prev.avg_energy * weight(prev) + seg.avg_energy * weight(&seg);
+                prev.end_time = prev.end_time.max(seg.end_time);
+                prev.frame_count = frames;
+            }
+            _ => merged.push(seg),
+        }
+    }
+    merged
+}

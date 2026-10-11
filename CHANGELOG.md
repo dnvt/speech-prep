@@ -17,6 +17,8 @@ uses [Semantic Versioning](https://semver.org/).
 - `VadConfig::min_speech_energy` to tune the absolute level below which a
   frame is never speech.
 - `VadDetector::with_metrics` for attaching a metrics collector.
+- `VadDetector::flush` to analyze the last partial frame and close a segment
+  that runs to the end of the stream.
 - `Error::Unsupported` for recognized but undecodable formats (Opus).
 - `cargo bench --bench throughput` and a `process_file` example.
 
@@ -57,6 +59,20 @@ uses [Semantic Versioning](https://semver.org/).
 - `QualityMetrics::spectral_centroid` is now computed from the spectrum. It
   used to be a weighted time index, not a frequency.
 - `VadDetector::reset` now also resets the adaptive baselines.
+- `VadDetector::detect` keeps samples that don't fill a frame for the next
+  call. Before, each call started a new frame grid, so blocks under about 64
+  samples never detected speech.
+- With `frame_overlap` above 0.5, consecutive speech segments could overlap
+  and the chunker emitted the overlapping audio twice. Segments are now
+  disjoint, and `Chunker` merges overlapping input segments.
+- Decoding no longer returns empty or partial audio without an error for
+  chained Ogg streams, or for files where many packets fail to decode. Same-layout chained
+  streams decode fully; a sample rate or channel count change is
+  `Error::Unsupported`.
+- `NoiseReductionConfig::validate` rejects a hop shorter than one sample,
+  which made `reduce` loop forever.
+- `FormatDetector::detect_with_metadata` picks the same track as the
+  decoder and recognizes every PCM variant (mu-law, A-law, big-endian).
 - `LICENSE-APACHE` now contains the full license text.
 
 ### Removed

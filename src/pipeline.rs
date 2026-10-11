@@ -134,7 +134,7 @@ impl Pipeline {
             }
         }
 
-        Ok(Self {
+        let mut pipeline = Self {
             vad,
             chunker,
             dc_filter,
@@ -142,7 +142,11 @@ impl Pipeline {
             pending: Vec::new(),
             pending_start: 0,
             last_tail: None,
-        })
+        };
+        // Components may have been used before; the pipeline counts samples
+        // from zero.
+        pipeline.reset();
+        Ok(pipeline)
     }
 
     /// Decode an encoded audio file or fragment and process it.
@@ -181,15 +185,33 @@ impl Pipeline {
         latencies.vad = vad_start.elapsed();
 
         self.pending.extend_from_slice(samples);
-
-        // Hold back audio from the start of a still-open speech segment.
         let pending_end = self.pending_start + self.pending.len();
+
+        // Emit only audio the VAD has finished classifying: everything before
+        // the open segment (or before the next unanalyzed frame), plus the
+        // full extent of any segment that just closed.
+        let closed_end = segments
+            .iter()
+            .map(|seg| self.sample_index(seg.end_time))
+            .max()
+            .unwrap_or(0);
         let emit_end = self
             .vad
-            .active_segment_start_sample()
-            .map_or(pending_end, |s| s.clamp(self.pending_start, pending_end));
+            .undecided_from()
+            .max(closed_end)
+            .clamp(self.pending_start, pending_end);
 
-        let chunks = self.emit(&segments, emit_end, &mut latencies)?;
+        // Without new speech, wait for a chunk's worth of silence instead of
+        // emitting a tiny chunk on every call.
+        let min_silence = Chunker::duration_to_samples(
+            self.chunker.config().target_duration,
+            STANDARD_SAMPLE_RATE,
+        );
+        let chunks = if segments.is_empty() && emit_end - self.pending_start < min_silence {
+            Vec::new()
+        } else {
+            self.emit(&segments, emit_end, &mut latencies)?
+        };
         latencies.total = start.elapsed();
         Ok(ProcessingResult { chunks, latencies })
     }
@@ -204,14 +226,8 @@ impl Pipeline {
         let start = AudioInstant::now();
         let mut latencies = StageLatencies::default();
 
-        // Enough silence for the VAD hangover to expire. The silence itself
-        // is not added to the output.
-        let config = *self.vad.config();
-        let frame_len = config.frame_length_samples()?;
-        let silence = vec![0.0f32; frame_len * (config.hangover_frames + 2)];
-
         let vad_start = AudioInstant::now();
-        let segments = self.vad.detect(&silence)?;
+        let segments = self.vad.flush()?;
         latencies.vad = vad_start.elapsed();
 
         let emit_end = self.pending_start + self.pending.len();
@@ -293,6 +309,10 @@ impl Pipeline {
         apply_overlaps(&mut chunks, overlap, STANDARD_SAMPLE_RATE);
         if let Some(first) = chunks.first_mut() {
             first.overlap_prev = self.last_tail.take();
+            if first.overlap_next.is_none() {
+                let len = first.overlap_prev.as_ref().map_or(0, Vec::len);
+                first.overlap_ms = (len as u64 * 1000 / u64::from(STANDARD_SAMPLE_RATE)) as u32;
+            }
         }
         self.last_tail = chunks.last().map(|last| {
             let from = last.samples.len().saturating_sub(overlap);
@@ -303,6 +323,13 @@ impl Pipeline {
         self.pending.drain(..count);
         self.pending_start = emit_end;
         Ok(chunks)
+    }
+
+    fn sample_index(&self, time: AudioTimestamp) -> usize {
+        let offset = time
+            .duration_since(self.vad.config().stream_start_time)
+            .unwrap_or_default();
+        (offset.as_nanos() * u128::from(STANDARD_SAMPLE_RATE) / 1_000_000_000) as usize
     }
 
     fn sample_time(&self, sample: usize) -> AudioTimestamp {
@@ -413,16 +440,95 @@ mod tests {
         assert!(rest.iter().any(ProcessedChunk::is_speech));
     }
 
+    fn speech_samples(chunks: &[ProcessedChunk]) -> usize {
+        chunks
+            .iter()
+            .filter(|c| c.is_speech())
+            .map(|c| c.samples.len())
+            .sum()
+    }
+
+    fn pipeline_with(vad: VadDetector) -> Pipeline {
+        Pipeline::with_components(
+            vad,
+            Chunker::default(),
+            DcHighPassFilter::new(PreprocessingConfig::default()).unwrap(),
+            NoiseReducer::new(NoiseReductionConfig::default()).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn block_size_does_not_change_coverage() {
-        let audio = burst(0.4, 1.2, 0.6);
-        for block in [160, 1_600, 8_000, audio.len()] {
+    fn block_size_does_not_change_result() {
+        let audio = burst(0.5, 1.0, 0.5);
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(reference > 15_000, "reference {reference}");
+
+        for block in [1, 16, 64, 160, 1_600, 8_000] {
             let chunks = run_streamed(&audio, block);
             assert_contiguous(&chunks, audio.len());
+            let speech = speech_samples(&chunks);
             assert!(
-                chunks.iter().any(ProcessedChunk::is_speech),
-                "block {block}"
+                speech.abs_diff(reference) <= 320,
+                "block {block}: {speech} speech samples vs {reference}"
             );
+            // Tiny blocks must not turn into tiny chunks.
+            assert!(chunks.len() <= 8, "block {block}: {} chunks", chunks.len());
+        }
+    }
+
+    #[test]
+    fn high_frame_overlap_does_not_duplicate_audio() {
+        let tone = |n: usize| burst(0.0, n as f32 / SR as f32, 0.0);
+        for gap in [400, 568, 700] {
+            let mut audio = vec![0.0f32; 4_000];
+            audio.extend(tone(5_000));
+            audio.extend(vec![0.0; gap]);
+            audio.extend(tone(5_000));
+            audio.extend(vec![0.0; 4_000]);
+
+            let mut pipeline = pipeline_with(
+                VadDetector::new(VadConfig {
+                    frame_overlap: 0.75,
+                    ..VadConfig::default()
+                })
+                .unwrap(),
+            );
+            let mut chunks = pipeline.process_samples(&audio).unwrap().chunks;
+            chunks.extend(pipeline.flush().unwrap().chunks);
+            assert_contiguous(&chunks, audio.len());
+        }
+    }
+
+    #[test]
+    fn previously_used_detector_is_reset() {
+        let vad = VadDetector::new(VadConfig::default()).unwrap();
+        vad.detect(&vec![0.0; SR]).unwrap();
+        let mut pipeline = pipeline_with(vad);
+
+        let audio = burst(0.5, 1.0, 0.5);
+        let mut chunks = Vec::new();
+        for block in audio.chunks(1_600) {
+            chunks.extend(pipeline.process_samples(block).unwrap().chunks);
+        }
+        chunks.extend(pipeline.flush().unwrap().chunks);
+
+        let reference = speech_samples(&run_streamed(&audio, audio.len()));
+        assert!(speech_samples(&chunks).abs_diff(reference) <= 320);
+    }
+
+    #[test]
+    fn overlap_ms_matches_overlap_vectors() {
+        let audio = burst(0.5, 1.0, 0.5);
+        for block in [1_600, 4_000] {
+            for chunk in run_streamed(&audio, block) {
+                let len = chunk
+                    .overlap_next
+                    .as_ref()
+                    .or(chunk.overlap_prev.as_ref())
+                    .map_or(0, Vec::len);
+                assert_eq!(chunk.overlap_ms as usize, len * 1000 / SR, "{chunk:?}");
+            }
         }
     }
 

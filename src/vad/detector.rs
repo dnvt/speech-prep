@@ -136,25 +136,53 @@ impl VadDetector {
 
     /// Detect speech in the next block of samples from the stream.
     ///
-    /// Successive calls are treated as one continuous stream: timestamps keep
-    /// increasing, and a segment still open at the end of a block is carried
-    /// into the next call. Feed trailing silence (or call
-    /// [`reset`](Self::reset)) to close it.
+    /// Successive calls are treated as one continuous stream, so blocks can
+    /// be any size: samples that do not fill a frame yet wait for the next
+    /// call, and a segment still open at the end of a block is reported once
+    /// it closes. Call [`flush`](Self::flush) at the end of the stream to get
+    /// the last segment.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Processing`] if framing or the FFT fails.
     pub fn detect(&self, samples: &[f32]) -> Result<Vec<SpeechChunk>> {
+        self.run(samples, false)
+    }
+
+    /// Analyze any samples still waiting for a full frame and close the open
+    /// speech segment, if there is one. Call this at the end of a stream;
+    /// call [`reset`](Self::reset) before starting another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Processing`] if the FFT fails.
+    pub fn flush(&self) -> Result<Vec<SpeechChunk>> {
+        self.run(&[], true)
+    }
+
+    /// First stream sample whose classification can still change: the start
+    /// of the open speech segment, or the first sample not yet covered by a
+    /// complete analysis frame.
+    pub(crate) fn undecided_from(&self) -> usize {
+        let state = self.lock_state();
+        state
+            .active_segment
+            .as_ref()
+            .map_or(state.carry_start, |seg| {
+                seg.start_sample.min(state.carry_start)
+            })
+    }
+
+    fn run(&self, samples: &[f32], finish: bool) -> Result<Vec<SpeechChunk>> {
         let detection_start = AudioInstant::now();
         let mut detector_state = self.lock_state();
 
-        let chunk_start_sample = detector_state.processed_samples;
-        let chunk_end_sample = chunk_start_sample + samples.len();
+        detector_state.processed_samples += samples.len();
+        let chunk_end_sample = detector_state.processed_samples;
 
-        let frames = self.frame_signal(samples, chunk_start_sample, &mut detector_state)?;
-        detector_state.processed_samples = chunk_end_sample;
+        let frames = self.frame_signal(samples, finish, &mut detector_state)?;
 
-        let (chunks, stats) = if frames.is_empty() {
+        let (mut chunks, stats) = if frames.is_empty() {
             (Vec::new(), VadStats::default())
         } else {
             let energy = Self::compute_energy(&frames);
@@ -167,6 +195,13 @@ impl VadDetector {
                 &mut detector_state,
             )?
         };
+
+        if finish {
+            if let Some(segment) = detector_state.active_segment.take() {
+                self.finalize_segment(&segment, chunk_end_sample, &mut chunks)?;
+                detector_state.last_segment_end = segment.last_end_sample.min(chunk_end_sample);
+            }
+        }
 
         let adaptive = AdaptiveThresholdSnapshot {
             energy_baseline: detector_state.energy_baseline,
@@ -186,62 +221,57 @@ impl VadDetector {
         Ok(chunks)
     }
 
+    /// Split the stream into analysis frames.
+    ///
+    /// New samples are pre-emphasized and appended to the samples left over
+    /// from earlier calls, so frames always sit on one grid regardless of how
+    /// the caller sizes its blocks. Only complete frames are analyzed, unless
+    /// `finish` is set, in which case the remainder is zero-padded.
     fn frame_signal(
         &self,
         samples: &[f32],
-        absolute_start: usize,
+        finish: bool,
         state: &mut DetectorState,
     ) -> Result<Vec<Frame>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let processed = self.preprocess_signal(samples, state);
+        state.carry.extend_from_slice(&processed);
+
         let frame_length = self.config.frame_length_samples()?;
         let hop_length = self.config.hop_length_samples()?;
 
-        if frame_length == 0 {
-            return Err(Error::Processing("frame length resolved to zero".into()));
-        }
-
         let mut frames = Vec::new();
         let mut start = 0usize;
+        loop {
+            let available = state.carry.len().saturating_sub(start);
+            let complete = available >= frame_length;
+            if !(complete || (finish && available > 0)) {
+                break;
+            }
 
-        while start + frame_length <= processed.len() {
-            let slice = &processed[start..start + frame_length];
-            let mut frame = Vec::with_capacity(frame_length);
-            frame.extend(
-                slice
-                    .iter()
-                    .zip(&self.window)
-                    .map(|(sample, window)| sample * window),
-            );
+            let slice = state.carry.get(start..start + available.min(frame_length));
+            let mut frame: Vec<f32> = slice
+                .unwrap_or_default()
+                .iter()
+                .zip(&self.window)
+                .map(|(sample, window)| sample * window)
+                .collect();
+            frame.resize(frame_length, 0.0);
+
             frames.push(Frame {
                 data: frame,
-                start_sample: absolute_start + start,
-                valid_len: frame_length,
+                start_sample: state.carry_start + start,
+                valid_len: available.min(frame_length),
             });
             start += hop_length;
         }
 
-        if start < processed.len() {
-            if let Some(slice) = processed.get(start..) {
-                let available = slice.len().min(frame_length);
-                let mut frame = Vec::with_capacity(frame_length);
-                frame.extend(
-                    slice
-                        .iter()
-                        .zip(&self.window)
-                        .map(|(sample, window)| sample * window),
-                );
-                frame.resize(frame_length, 0.0);
-                frames.push(Frame {
-                    data: frame,
-                    start_sample: absolute_start + start,
-                    valid_len: available,
-                });
-            }
-        }
+        let consumed = if finish {
+            state.carry.len()
+        } else {
+            start.min(state.carry.len())
+        };
+        state.carry.drain(..consumed);
+        state.carry_start += consumed;
 
         Ok(frames)
     }
@@ -361,6 +391,7 @@ impl VadDetector {
             self.config.base_threshold * self.config.activation_margin * 2.0;
 
         let mut active_segment = detector_state.active_segment.take();
+        let mut last_segment_end = detector_state.last_segment_end;
         let mut silence_run = active_segment
             .as_ref()
             .map_or(0usize, |state| state.silence_run);
@@ -412,8 +443,11 @@ impl VadDetector {
             };
 
             if is_speech {
-                let segment_state = active_segment
-                    .get_or_insert_with(|| ActiveSegmentState::new(frame.start_sample));
+                // Overlapping frames can make a new segment start before the
+                // previous one ended; never let segments overlap.
+                let start = frame.start_sample.max(last_segment_end);
+                let segment_state =
+                    active_segment.get_or_insert_with(|| ActiveSegmentState::new(start));
                 segment_state.score_sum += combined;
                 segment_state.energy_sum += raw_energy;
                 segment_state.frame_count += 1;
@@ -426,6 +460,7 @@ impl VadDetector {
                     detector_state.active_segment = Some(segment_state);
                     return Err(err);
                 }
+                last_segment_end = segment_state.last_end_sample.min(chunk_end_sample);
                 silence_run = 0;
             }
 
@@ -459,8 +494,9 @@ impl VadDetector {
         detector_state.dynamic_threshold = dynamic_threshold;
         detector_state.energy_baseline = energy_baseline;
         detector_state.flux_baseline = flux_baseline;
+        detector_state.last_segment_end = last_segment_end;
 
-        // Preserve active segment for streaming continuity; flush to finalize
+        // Keep the open segment for the next call; `flush` closes it.
         if let Some(mut segment_state) = active_segment {
             segment_state.silence_run = silence_run;
             detector_state.active_segment = Some(segment_state);
@@ -550,7 +586,14 @@ struct Frame {
 }
 
 pub(super) struct DetectorState {
+    /// Samples received so far.
     pub(super) processed_samples: usize,
+    /// Pre-emphasized samples not yet consumed by a complete frame.
+    pub(super) carry: Vec<f32>,
+    /// Stream index of `carry[0]`.
+    pub(super) carry_start: usize,
+    /// End of the last closed segment; new segments start at or after it.
+    pub(super) last_segment_end: usize,
     pub(super) energy_baseline: f32,
     pub(super) flux_baseline: f32,
     pub(super) dynamic_threshold: f32,
@@ -572,6 +615,9 @@ impl DetectorState {
     fn new(config: &VadConfig, spectrum_bins: usize) -> Self {
         Self {
             processed_samples: 0,
+            carry: Vec::new(),
+            carry_start: 0,
+            last_segment_end: 0,
             energy_baseline: config.energy_floor.max(EPSILON),
             flux_baseline: config.flux_floor.max(EPSILON),
             dynamic_threshold: config.base_threshold.max(EPSILON),
@@ -677,6 +723,64 @@ mod tests {
         for (a, e) in actual.iter().zip(&expected) {
             assert!((a.start_time.as_secs() - e.start_time.as_secs()).abs() < 0.03);
             assert!((a.end_time.as_secs() - e.end_time.as_secs()).abs() < 0.03);
+        }
+    }
+
+    #[test]
+    fn tiny_blocks_match_single_call() {
+        let audio = tone_burst(0.5, 1.0);
+        let expected = VadDetector::new(VadConfig::default())
+            .unwrap()
+            .detect(&audio)
+            .unwrap();
+
+        for block in [1, 7, 64] {
+            let detector = VadDetector::new(VadConfig::default()).unwrap();
+            let mut actual = Vec::new();
+            for b in audio.chunks(block) {
+                actual.extend(detector.detect(b).unwrap());
+            }
+            actual.extend(detector.flush().unwrap());
+            assert_eq!(actual.len(), expected.len(), "block {block}");
+            let drift = actual[0].start_time.as_secs() - expected[0].start_time.as_secs();
+            assert!(drift.abs() < 0.02, "block {block}: start drift {drift}");
+        }
+    }
+
+    #[test]
+    fn flush_closes_trailing_segment() {
+        // Audio that ends while the tone is still playing.
+        let audio = &tone_burst(0.5, 1.0)[..SR + SR / 2];
+        let detector = VadDetector::new(VadConfig::default()).unwrap();
+        assert!(detector.detect(audio).unwrap().is_empty());
+
+        let closed = detector.flush().unwrap();
+        assert_eq!(closed.len(), 1);
+        let end = closed[0].end_time.as_secs();
+        assert!((end - 1.5).abs() < 0.03, "segment ends at {end}");
+    }
+
+    #[test]
+    fn segments_never_overlap() {
+        let config = VadConfig {
+            frame_overlap: 0.9,
+            ..VadConfig::default()
+        };
+        for gap in (100..1_200).step_by(37) {
+            let mut audio = tone_burst(0.25, 0.3);
+            audio.truncate(audio.len() - SR / 4 + gap);
+            audio.extend(tone_burst(0.0, 0.3));
+            audio.extend(vec![0.0; SR / 2]);
+
+            let detector = VadDetector::new(config).unwrap();
+            let mut segments = detector.detect(&audio).unwrap();
+            segments.extend(detector.flush().unwrap());
+            for pair in segments.windows(2) {
+                assert!(
+                    pair[1].start_time >= pair[0].end_time,
+                    "gap {gap}: {pair:?}"
+                );
+            }
         }
     }
 

@@ -6,9 +6,9 @@ mod resampler;
 use std::io::Cursor;
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -54,26 +54,14 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
         .map_err(|err| Error::InvalidInput(format!("unrecognized or malformed audio: {err}")))?;
     let mut reader = probed.format;
 
-    let track = reader
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?;
-    let track_id = track.id;
-    let params = track.codec_params.clone();
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&params, &DecoderOptions::default())
-        .map_err(|_| {
-            Error::Unsupported(
-                "no decoder for this codec (supported: PCM, FLAC, MP3, AAC-LC, Vorbis)".into(),
-            )
-        })?;
+    let (mut track_id, mut decoder) = open_track(reader.as_ref())?;
+    let params = decoder.codec_params().clone();
 
     let mut sample_rate = params.sample_rate;
     let mut channels = params.channels.map(|c| c.count());
     let mut samples = Vec::new();
     let mut buffer: Option<SampleBuffer<f32>> = None;
+    let (mut packets, mut skipped) = (0usize, 0usize);
 
     loop {
         let packet = match reader.next_packet() {
@@ -83,17 +71,33 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
             {
                 break;
             }
-            Err(SymphoniaError::ResetRequired) => break,
+            // A new logical stream started (e.g. chained Ogg). Reopen it and
+            // carry on if it has the same layout.
+            Err(SymphoniaError::ResetRequired) => {
+                (track_id, decoder) = open_track(reader.as_ref())?;
+                let next = decoder.codec_params();
+                check_layout(
+                    &mut sample_rate,
+                    &mut channels,
+                    next.sample_rate,
+                    next.channels.map(|c| c.count()),
+                )?;
+                continue;
+            }
             Err(err) => return Err(Error::InvalidInput(format!("failed to read audio: {err}"))),
         };
         if packet.track_id() != track_id {
             continue;
         }
+        packets += 1;
 
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
             // A corrupt packet in an otherwise valid stream; skip it.
-            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError(_)) => {
+                skipped += 1;
+                continue;
+            }
             Err(err) => {
                 return Err(Error::InvalidInput(format!(
                     "failed to decode audio: {err}"
@@ -102,8 +106,12 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
         };
 
         let spec = *decoded.spec();
-        sample_rate.get_or_insert(spec.rate);
-        channels.get_or_insert(spec.channels.count());
+        check_layout(
+            &mut sample_rate,
+            &mut channels,
+            Some(spec.rate),
+            Some(spec.channels.count()),
+        )?;
 
         let needed = decoded.capacity() * spec.channels.count();
         let buf = match &mut buffer {
@@ -112,6 +120,16 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
         };
         buf.copy_interleaved_ref(decoded);
         samples.extend_from_slice(buf.samples());
+    }
+
+    // Tolerate the odd corrupt frame, but not a stream that mostly fails.
+    if skipped > 0 {
+        if skipped * MAX_SKIPPED_DENOMINATOR > packets {
+            return Err(Error::InvalidInput(format!(
+                "{skipped} of {packets} audio packets could not be decoded"
+            )));
+        }
+        tracing::warn!(skipped, packets, "skipped undecodable audio packets");
     }
 
     let sample_rate = sample_rate
@@ -129,6 +147,60 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
         channels,
         bit_depth: params.bits_per_sample.and_then(|b| u16::try_from(b).ok()),
     })
+}
+
+/// More than 1 in this many packets failing to decode is an error.
+const MAX_SKIPPED_DENOMINATOR: usize = 10;
+
+/// Pick the first audio track and build a decoder for it.
+fn open_track(reader: &dyn FormatReader) -> Result<(u32, Box<dyn Decoder>)> {
+    let track = reader
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?;
+
+    let decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|_| {
+            Error::Unsupported(
+                "no decoder for this codec (supported: PCM, FLAC, MP3, AAC-LC, Vorbis)".into(),
+            )
+        })?;
+    Ok((track.id, decoder))
+}
+
+/// Record the stream layout on first sight and reject later changes, which
+/// would otherwise corrupt the interleaved output.
+fn check_layout(
+    rate: &mut Option<u32>,
+    channels: &mut Option<usize>,
+    new_rate: Option<u32>,
+    new_channels: Option<usize>,
+) -> Result<()> {
+    for (known, new, what) in [
+        (
+            rate.map(|r| r as usize),
+            new_rate.map(|r| r as usize),
+            "sample rate",
+        ),
+        (*channels, new_channels, "channel count"),
+    ] {
+        if let (Some(known), Some(new)) = (known, new) {
+            if known != new {
+                return Err(Error::Unsupported(format!(
+                    "{what} changes partway through the stream ({known} to {new})"
+                )));
+            }
+        }
+    }
+    if rate.is_none() {
+        *rate = new_rate;
+    }
+    if channels.is_none() {
+        *channels = new_channels;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
