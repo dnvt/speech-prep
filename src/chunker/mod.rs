@@ -110,6 +110,14 @@ impl Chunker {
         if sample_rate == 0 {
             return Err(Error::InvalidInput("sample_rate must be > 0".into()));
         }
+        // A struct-literal `ChunkerConfig` skips `ChunkerConfig::new`; a
+        // sub-millisecond target would divide by zero below or, clamped, cut
+        // the audio into one-sample chunks.
+        if self.config.target_duration.as_millis() == 0 {
+            return Err(Error::Configuration(
+                "target_duration must be at least 1 ms".into(),
+            ));
+        }
         if audio.is_empty() {
             return Err(Error::InvalidInput("audio buffer is empty".into()));
         }
@@ -136,9 +144,8 @@ impl Chunker {
         let noise_baseline =
             Self::compute_noise_baseline(audio, sample_rate, &segments, audio_start);
 
-        let estimated_chunks =
-            (total_duration.as_millis() / self.config.target_duration.as_millis()).max(1) as usize
-                + 1;
+        let target_ms = self.config.target_duration.as_millis();
+        let estimated_chunks = (total_duration.as_millis() / target_ms).max(1) as usize + 1;
         let mut chunks = Vec::with_capacity(estimated_chunks);
 
         if segments.is_empty() {

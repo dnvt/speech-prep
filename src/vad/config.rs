@@ -168,8 +168,12 @@ impl VadConfig {
             ));
         }
 
-        if self.min_speech_energy.is_nan() || self.min_speech_energy < 0.0 {
-            return Err(invalid_input("min_speech_energy must be non-negative"));
+        // An infinite gate would pass a sign check and silently disable
+        // detection, so require a finite value.
+        if !self.min_speech_energy.is_finite() || self.min_speech_energy < 0.0 {
+            return Err(invalid_input(
+                "min_speech_energy must be finite and non-negative",
+            ));
         }
 
         if !(0.0..1.0).contains(&self.noise_smoothing) {
@@ -266,6 +270,14 @@ mod tests {
             },
             VadConfig {
                 min_speech_energy: -1.0,
+                ..VadConfig::default()
+            },
+            VadConfig {
+                min_speech_energy: f32::INFINITY,
+                ..VadConfig::default()
+            },
+            VadConfig {
+                min_speech_energy: f32::NAN,
                 ..VadConfig::default()
             },
         ] {
