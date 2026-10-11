@@ -823,3 +823,19 @@ fn test_overlapping_segments_are_merged() {
         assert_eq!(pair[0].end_time, pair[1].start_time);
     }
 }
+
+#[test]
+fn sub_millisecond_target_duration_is_a_configuration_error() {
+    // A struct-literal config bypasses ChunkerConfig::new's validation; a
+    // target_duration under 1 ms used to divide by zero when estimating the
+    // chunk count.
+    let audio = vec![0.0f32; 16_000];
+    for target_duration in [Duration::ZERO, Duration::from_micros(500)] {
+        let chunker = Chunker::new(ChunkerConfig {
+            target_duration,
+            ..ChunkerConfig::default()
+        });
+        let err = chunker.chunk(&audio, 16_000, &[]).unwrap_err();
+        assert!(matches!(err, Error::Configuration(_)), "{err:?}");
+    }
+}
