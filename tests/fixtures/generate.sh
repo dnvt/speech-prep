@@ -27,3 +27,4 @@ ffmpeg $q -i tone.flac $small -c:a alac tone-alac.m4a
 ffmpeg $q -i tone.flac $small tone.aiff
 ffmpeg $q -i tone.flac $small -c:a adpcm_ima_wav tone-adpcm.wav
 ffmpeg $q -i tone.flac $small -c:a pcm_s16le tone.caf
+ffmpeg $q -i tone.flac $small -c:a libopus -b:a 24k tone-opus.webm

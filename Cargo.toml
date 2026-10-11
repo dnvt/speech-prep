@@ -23,12 +23,21 @@ include = [
 
 [dependencies]
 symphonia = { version = "0.6", default-features = false, features = ["aac", "adpcm", "alac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav", "aiff", "caf"] }
+symphonia-adapter-opus-rs = { version = "0.1", optional = true }
 realfft = "3.5"
 tracing = "0.1"
 thiserror = "2"
 
+[features]
+# Opus decoding with a pure-Rust decoder (ruopus). Off by default: it adds
+# about 20 crates and its dependencies need Rust 1.95.
+opus = ["dep:symphonia-adapter-opus-rs"]
+
 [dev-dependencies]
 hound = "3"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bench]]
 name = "throughput"

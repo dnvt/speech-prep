@@ -87,7 +87,14 @@ fn main() -> speech_prep::Result<()> {
 | MP3 | MP3 | yes |
 | AAC-LC | MP4/M4A | yes |
 | Vorbis | Ogg, WebM | yes |
-| Opus | Ogg, WebM | no: detected, then rejected with `Error::Unsupported` |
+| Opus | Ogg, WebM | with the `opus` feature |
+
+Opus support is opt-in because its pure-Rust decoder adds about 20
+dependencies and needs Rust 1.95:
+
+```toml
+speech-prep = { version = "0.2", features = ["opus"] }
+```
 
 Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia). Any
 channel count is averaged to mono, and sample rates from 4 to 768 kHz are
