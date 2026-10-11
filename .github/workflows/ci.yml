@@ -47,7 +47,7 @@ jobs:
       - run: cargo test
       - run: cargo test --features opus
       - run: cargo run --example vad_detect
-      - run: cargo run --example process_file -- tests/fixtures/tone.mp3
+      - run: cargo run --example process_file -- tests/fixtures/jfk.ogg
       - run: cargo bench --no-run
 
   msrv:

@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|c| c.is_speech())
         .filter_map(|c| c.duration().ok())
         .map(|d| d.as_secs_f64())
-        .sum();
+        .fold(0.0, |total, secs| total + secs);
     println!("\n{} chunks, {speech_secs:.2} s of speech", chunks.len());
     Ok(())
 }
