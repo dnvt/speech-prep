@@ -35,3 +35,14 @@ cargo +nightly fuzz run pipeline -- -max_total_time=300
 - Add a line to `CHANGELOG.md` under `Unreleased` for user-visible changes.
 - If a substantial part of a change was AI-generated, say so in the pull
   request, and make sure you can explain every line of it.
+
+## Releasing
+
+1. In a pull request, set `version` in `Cargo.toml` and rename the
+   `Unreleased` section of `CHANGELOG.md` to `## [x.y.z] - date`.
+2. After it merges, run the **Release** workflow from the Actions tab on
+   `main` with "dry run" unticked, or push a `vx.y.z` tag.
+
+The workflow checks that the version, tag, and changelog agree, publishes
+to crates.io through trusted publishing, and creates the GitHub release
+with the changelog section as its notes.

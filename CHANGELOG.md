@@ -8,6 +8,23 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [0.2.0] - 2026-10-11
 
+### Upgrading from 0.1
+
+| 0.1 | 0.2 |
+| --- | --- |
+| `AudioPipelineCoordinator::new_with_defaults()` | `Pipeline::new()?` |
+| `AudioPipelineCoordinator::new(Arc::new(vad), chunker, dc, nr)` | `Pipeline::with_components(vad, chunker, dc, nr)?` |
+| `coordinator.process_frame(&bytes)` | `pipeline.process_bytes(&bytes)` (`&mut self`; `.chunks` holds the cleaned chunks) |
+| `VadDetector::new(config, metrics)` | `VadDetector::new(config)` or `VadDetector::with_metrics(config, metrics)` |
+| `VADStats` | `vad::VadStats` |
+| `VadConfig { activation_margin, release_margin, energy_weight, flux_weight, .. }` | `VadConfig { activation_ratio, release_ratio, .. }` |
+| `chunk.overlap_next` | the next chunk's `overlap_prev`, or `chunk.samples_with_context()` |
+| `AudioFormat::WebM` | `AudioFormat::Vorbis` or `AudioFormat::Opus` |
+| `AudioBuffer`, `AudioChunk`, the `fixtures` feature | removed |
+
+`Error` and `AudioFormat` are `#[non_exhaustive]`, so a `match` on them
+needs a wildcard arm. Opus needs `features = ["opus"]` (Rust 1.95).
+
 ### Added
 
 - Decoding of FLAC, ALAC, MP3, AAC (MP4/M4A), Ogg/WebM Vorbis, AIFF, CAF,
