@@ -1,9 +1,7 @@
 use crate::error::{Error, Result};
 use crate::time::{AudioDuration, AudioTimestamp};
 
-/// Type of boundary at chunk edges.
-///
-/// Indicates the speech context at the start and end of a chunk.
+/// What a chunk edge lines up with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkBoundary {
     /// Chunk starts at beginning of speech segment.
@@ -19,9 +17,7 @@ pub enum ChunkBoundary {
     Silence,
 }
 
-/// A processed audio chunk with temporal and quality metadata.
-///
-/// Represents a segment of audio aligned to speech boundaries.
+/// A chunk of audio with timing and quality information.
 #[derive(Debug, Clone)]
 pub struct ProcessedChunk {
     /// Audio samples in the chunk (normalized f32, range [-1.0, 1.0]).
@@ -39,57 +35,32 @@ pub struct ProcessedChunk {
     /// Absolute end time of chunk in audio stream.
     pub end_time: AudioTimestamp,
 
-    /// Ratio of speech frames in chunk (0.0 = all silence, 1.0 = all speech).
-    ///
-    /// Derived from VAD analysis.
+    /// Fraction of the chunk covered by VAD speech, from 0.0 to 1.0.
     pub speech_ratio: f32,
 
-    /// RMS energy of the chunk (computed during generation).
-    ///
-    /// Useful for quality assessment and thresholding.
+    /// RMS level of `samples`.
     pub energy: f32,
 
-    /// Signal-to-noise ratio in decibels (dB).
-    ///
-    /// Computed as `20 * log10(signal_rms / noise_rms)`, where `noise_rms` is
-    /// estimated from silence regions. `None` if no noise baseline is available
-    /// (e.g., first chunk with no silence).
-    ///
-    /// Higher SNR values indicate cleaner audio:
-    /// - >30 dB: Excellent quality
-    /// - 20-30 dB: Good quality
-    /// - 10-20 dB: Acceptable quality
-    /// - <10 dB: Poor quality (high noise)
+    /// Estimated SNR in dB: `20 * log10(chunk_rms / noise_rms)`, with the
+    /// noise level taken from the silent parts of the input. `None` when no
+    /// silence was available to estimate it. Measured on the input, before
+    /// any cleanup.
     pub snr_db: Option<f32>,
 
-    /// Indicates whether the chunk contains clipping artifacts.
-    ///
-    /// Clipping occurs when sample values exceed the normalized range
-    /// [-1.0, 1.0], typically manifesting as |sample| >= 0.999.
-    /// Clipped audio may cause audible distortion.
-    ///
-    /// `true` if any sample in the chunk is clipped, `false` otherwise.
+    /// `true` if any sample reaches `|x| >= 0.999`, which usually means the
+    /// recording clipped.
     pub has_clipping: bool,
 
-    /// Overlap samples from the previous chunk (for context).
-    ///
-    /// Contains the trailing `overlap_duration` samples from the previous
-    /// chunk, preserving acoustic context across the boundary.
-    /// `None` for the first chunk in the stream.
+    /// Last `overlap_duration` of the previous chunk, for models that need
+    /// left context. `None` for the first chunk of a stream.
     pub overlap_prev: Option<Vec<f32>>,
 
-    /// Overlap samples for the next chunk (for context).
-    ///
-    /// Contains the trailing `overlap_duration` samples from this chunk, to be
-    /// prepended to the next chunk for context. `None` for the last chunk in
-    /// the stream.
+    /// Last `overlap_duration` of this chunk, i.e. the next chunk's
+    /// `overlap_prev`. `None` for the last chunk of a call.
     pub overlap_next: Option<Vec<f32>>,
 
-    /// Actual overlap duration in milliseconds.
-    ///
-    /// The duration of samples in `overlap_prev` and `overlap_next`. Typically
-    /// matches `ChunkerConfig::overlap_duration` (default 50ms), but may be
-    /// shorter for chunks at stream boundaries.
+    /// Length of the overlap vectors in milliseconds. Can be shorter than
+    /// configured next to very short chunks.
     pub overlap_ms: u32,
 }
 
@@ -118,15 +89,6 @@ impl ProcessedChunk {
     #[must_use]
     pub fn is_silence(&self) -> bool {
         self.start_boundary == ChunkBoundary::Silence && self.end_boundary == ChunkBoundary::Silence
-    }
-
-    /// Get samples without overlap (deduplicated core content).
-    ///
-    /// Returns the chunk's primary samples, excluding any overlap regions that
-    /// would be duplicated when processing sequential chunks. Useful for
-    /// callers that want to avoid processing overlap regions twice.
-    pub fn samples_without_overlap(&self) -> &[f32] {
-        &self.samples
     }
 
     /// Returns total sample count including overlap regions.

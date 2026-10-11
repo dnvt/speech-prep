@@ -4,13 +4,15 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::monitoring::{AtomicCounter, VADStats};
 use crate::time::{AudioDuration, AudioInstant, AudioTimestamp};
 use parking_lot::Mutex;
 use realfft::{RealFftPlanner, RealToComplex};
 
 use super::config::VadConfig;
-use super::metrics::{AdaptiveThresholdSnapshot, VadMetricsCollector, VadMetricsSnapshot};
+use super::metrics::{
+    AdaptiveThresholdSnapshot, NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot,
+    VadStats,
+};
 
 /// Number of nanoseconds in one second, used for time conversion.
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -29,20 +31,16 @@ const MAX_SMOOTHING_FACTOR: f32 = 0.999;
 /// signals.
 const MAX_NORMALIZED_METRIC: f32 = 10.0;
 
-/// Energy level under which we consider a frame near-silence regardless of
-/// normalization.
-const SILENCE_ENERGY_GATE: f32 = 0.02;
 /// Relative energy ratio below which we consider a frame near-silence.
 const SILENCE_RELATIVE_GATE: f32 = 1.7;
 
-/// Real-time voice activity detector combining energy and spectral flux
-/// metrics.
+/// Streaming voice activity detector. See the [module docs](super) for an
+/// example and [`VadConfig`] for tuning.
 pub struct VadDetector {
     config: VadConfig,
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
     metrics: Arc<dyn VadMetricsCollector>,
-    processed_samples: AtomicCounter,
     energy_weight: f32,
     flux_weight: f32,
     state: Mutex<DetectorState>,
@@ -50,7 +48,7 @@ pub struct VadDetector {
 
 impl fmt::Debug for VadDetector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let processed_samples = self.processed_samples.get();
+        let processed_samples = self.state.lock().processed_samples;
         f.debug_struct("VadDetector")
             .field("config", &self.config)
             .field("window_length", &self.window.len())
@@ -62,8 +60,22 @@ impl fmt::Debug for VadDetector {
 }
 
 impl VadDetector {
-    /// Construct a new detector instance.
-    pub fn new(config: VadConfig, metrics: Arc<dyn VadMetricsCollector>) -> Result<Self> {
+    /// Create a detector with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `config` fails validation.
+    pub fn new(config: VadConfig) -> Result<Self> {
+        Self::with_metrics(config, Arc::new(NoopVadMetricsCollector))
+    }
+
+    /// Create a detector that reports a [`VadMetricsSnapshot`] to `metrics`
+    /// after every [`detect`](Self::detect) call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `config` fails validation.
+    pub fn with_metrics(config: VadConfig, metrics: Arc<dyn VadMetricsCollector>) -> Result<Self> {
         config.validate()?;
 
         let frame_length = config.frame_length_samples()?;
@@ -78,39 +90,27 @@ impl VadDetector {
             config.flux_weight / total_weight,
         );
 
-        let previous_spectrum = {
-            let tmp = fft.make_output_vec();
-            vec![0.0; tmp.len()]
-        };
-
-        let state = DetectorState {
-            energy_baseline: config.energy_floor.max(EPSILON),
-            flux_baseline: config.flux_floor.max(EPSILON),
-            dynamic_threshold: config.base_threshold.max(EPSILON),
-            previous_spectrum,
-            pre_emphasis_prev: 0.0,
-            active_segment: None,
-        };
+        let state = DetectorState::new(&config, fft.make_output_vec().len());
 
         Ok(Self {
             config,
             fft,
             window,
             metrics,
-            processed_samples: AtomicCounter::new(0),
             energy_weight,
             flux_weight,
             state: Mutex::new(state),
         })
     }
 
-    /// Access detector configuration.
+    /// The configuration this detector was built with.
     #[must_use]
     pub fn config(&self) -> &VadConfig {
         &self.config
     }
 
-    /// Return the start sample of the currently active speech segment, if any.
+    /// Start sample of the speech segment still open at the end of the last
+    /// [`detect`](Self::detect) call, if any.
     #[must_use]
     pub fn active_segment_start_sample(&self) -> Option<usize> {
         let state = self.state.lock();
@@ -120,57 +120,48 @@ impl VadDetector {
             .map(|segment| segment.start_sample)
     }
 
-    /// Reset processed sample count and stream start time.
+    /// Clear all streaming state, including the adaptive baselines, and set a
+    /// new stream start time.
     pub fn reset(&mut self, stream_start_time: AudioTimestamp) {
         self.config.stream_start_time = stream_start_time;
-        self.processed_samples.reset();
-        let mut state = self.state.lock();
-        state.active_segment = None;
-        state.pre_emphasis_prev = 0.0;
+        let bins = self.fft.make_output_vec().len();
+        *self.state.lock() = DetectorState::new(&self.config, bins);
     }
 
-    /// Run detection on a slice of samples, returning detected speech segments.
+    /// Detect speech in the next block of samples from the stream.
+    ///
+    /// Successive calls are treated as one continuous stream: timestamps keep
+    /// increasing, and a segment still open at the end of a block is carried
+    /// into the next call. Feed trailing silence (or call
+    /// [`reset`](Self::reset)) to close it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Processing`] if framing or the FFT fails.
     pub fn detect(&self, samples: &[f32]) -> Result<Vec<SpeechChunk>> {
         let detection_start = AudioInstant::now();
-        let chunk_len = samples.len() as u64;
-
         let mut detector_state = self.state.lock();
 
-        let chunk_start_sample = self.processed_samples.fetch_add(chunk_len) as usize;
+        let chunk_start_sample = detector_state.processed_samples;
         let chunk_end_sample = chunk_start_sample + samples.len();
 
-        let frames = match self.frame_signal(samples, chunk_start_sample, &mut detector_state) {
-            Ok(frames) => frames,
-            Err(err) => {
-                let _ = self.processed_samples.fetch_sub(chunk_len);
-                drop(detector_state);
-                return Err(err);
-            }
+        let frames = self.frame_signal(samples, chunk_start_sample, &mut detector_state)?;
+        detector_state.processed_samples = chunk_end_sample;
+
+        let (chunks, stats) = if frames.is_empty() {
+            (Vec::new(), VadStats::default())
+        } else {
+            let energy = Self::compute_energy(&frames);
+            let flux = self.compute_spectral_flux(&frames, &mut detector_state)?;
+            self.merge_metrics(
+                &frames,
+                &energy,
+                &flux,
+                chunk_end_sample,
+                &mut detector_state,
+            )?
         };
 
-        if frames.is_empty() {
-            let latency = AudioInstant::now().duration_since(detection_start);
-            let adaptive = AdaptiveThresholdSnapshot {
-                energy_baseline: detector_state.energy_baseline,
-                flux_baseline: detector_state.flux_baseline,
-                dynamic_threshold: detector_state.dynamic_threshold,
-            };
-            let snapshot = VadMetricsSnapshot::new(VADStats::new(), latency, adaptive);
-            self.metrics.record_vad_metrics(&snapshot);
-            drop(detector_state);
-            return Ok(Vec::new());
-        }
-
-        let energy = Self::compute_energy(&frames);
-        let flux = self.compute_spectral_flux(&frames, &mut detector_state)?;
-        let (chunks, mut stats) = self.merge_metrics(
-            &frames,
-            &energy,
-            &flux,
-            chunk_end_sample,
-            &mut detector_state,
-        )?;
-        stats.speech_frames = chunks.len() as u64;
         let adaptive = AdaptiveThresholdSnapshot {
             energy_baseline: detector_state.energy_baseline,
             flux_baseline: detector_state.flux_baseline,
@@ -179,7 +170,11 @@ impl VadDetector {
         drop(detector_state);
 
         let latency = AudioInstant::now().duration_since(detection_start);
-        let snapshot = VadMetricsSnapshot::new(stats, latency, adaptive);
+        let snapshot = VadMetricsSnapshot {
+            stats,
+            latency,
+            adaptive,
+        };
         self.metrics.record_vad_metrics(&snapshot);
 
         Ok(chunks)
@@ -207,7 +202,6 @@ impl VadDetector {
         let mut start = 0usize;
 
         while start + frame_length <= processed.len() {
-            #[allow(clippy::indexing_slicing)] // bounds checked by while condition
             let slice = &processed[start..start + frame_length];
             let mut frame = Vec::with_capacity(frame_length);
             frame.extend(
@@ -337,8 +331,8 @@ impl VadDetector {
         flux: &[f32],
         chunk_end_sample: usize,
         detector_state: &mut DetectorState,
-    ) -> Result<(Vec<SpeechChunk>, VADStats)> {
-        let mut stats = VADStats::new();
+    ) -> Result<(Vec<SpeechChunk>, VadStats)> {
+        let mut stats = VadStats::default();
         let mut segments = Vec::new();
 
         let mut dynamic_threshold = detector_state.dynamic_threshold.max(EPSILON);
@@ -366,7 +360,6 @@ impl VadDetector {
             .map_or(0usize, |state| state.silence_run);
 
         for (idx, frame) in frames.iter().enumerate() {
-            let frame_start = AudioInstant::now();
             let raw_energy = energy.get(idx).copied().ok_or_else(|| {
                 Error::Processing(format!("energy array length mismatch at index {idx}"))
             })?;
@@ -392,7 +385,7 @@ impl VadDetector {
             };
             let threshold =
                 base_threshold.max(self.config.base_threshold * self.config.release_margin);
-            let low_energy = raw_energy < SILENCE_ENERGY_GATE;
+            let low_energy = raw_energy < self.config.min_speech_energy;
             let low_relative_energy = energy_ratio < SILENCE_RELATIVE_GATE;
             let mut raw_is_speech = combined >= threshold;
             if raw_is_speech && (low_energy || low_relative_energy) {
@@ -430,8 +423,12 @@ impl VadDetector {
                 silence_run = 0;
             }
 
-            let _frame_processing = AudioInstant::now().duration_since(frame_start);
             stats.frames_processed += 1;
+            if is_speech {
+                stats.speech_frames += 1;
+            } else {
+                stats.silence_frames += 1;
+            }
 
             // Update baselines only during silence to avoid noise floor contamination
             if !is_speech {
@@ -547,6 +544,7 @@ struct Frame {
 }
 
 pub(super) struct DetectorState {
+    pub(super) processed_samples: usize,
     pub(super) energy_baseline: f32,
     pub(super) flux_baseline: f32,
     pub(super) dynamic_threshold: f32,
@@ -562,6 +560,20 @@ pub(super) struct ActiveSegmentState {
     pub(super) energy_sum: f32,
     pub(super) frame_count: usize,
     pub(super) silence_run: usize,
+}
+
+impl DetectorState {
+    fn new(config: &VadConfig, spectrum_bins: usize) -> Self {
+        Self {
+            processed_samples: 0,
+            energy_baseline: config.energy_floor.max(EPSILON),
+            flux_baseline: config.flux_floor.max(EPSILON),
+            dynamic_threshold: config.base_threshold.max(EPSILON),
+            previous_spectrum: vec![0.0; spectrum_bins],
+            pre_emphasis_prev: 0.0,
+            active_segment: None,
+        }
+    }
 }
 
 impl ActiveSegmentState {
@@ -602,5 +614,98 @@ impl SpeechChunk {
                     "failed to compute segment duration: end_time precedes start_time".into(),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use super::*;
+
+    const SR: usize = 16_000;
+
+    /// `silence_s` of silence, `tone_s` of a 1 kHz tone, `silence_s` of
+    /// silence.
+    fn tone_burst(silence_s: f32, tone_s: f32) -> Vec<f32> {
+        let pad = (silence_s * SR as f32) as usize;
+        let tone = (tone_s * SR as f32) as usize;
+        let mut audio = vec![0.0; pad * 2 + tone];
+        for (i, s) in audio[pad..pad + tone].iter_mut().enumerate() {
+            *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
+        }
+        audio
+    }
+
+    #[test]
+    fn silence_produces_no_segments() {
+        let detector = VadDetector::new(VadConfig::default()).unwrap();
+        assert!(detector.detect(&vec![0.0; SR]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn detects_tone_burst_boundaries() {
+        let detector = VadDetector::new(VadConfig::default()).unwrap();
+        let segments = detector.detect(&tone_burst(0.5, 1.0)).unwrap();
+
+        assert_eq!(segments.len(), 1);
+        let seg = segments[0];
+        assert!((seg.start_time.as_secs() - 0.5).abs() < 0.05, "{seg:?}");
+        assert!((seg.end_time.as_secs() - 1.5).abs() < 0.1, "{seg:?}");
+    }
+
+    #[test]
+    fn streaming_matches_single_call() {
+        let audio = tone_burst(0.5, 1.0);
+
+        let whole = VadDetector::new(VadConfig::default()).unwrap();
+        let expected = whole.detect(&audio).unwrap();
+
+        let streamed = VadDetector::new(VadConfig::default()).unwrap();
+        let mut actual = Vec::new();
+        for block in audio.chunks(1600) {
+            actual.extend(streamed.detect(block).unwrap());
+        }
+
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(&expected) {
+            assert!((a.start_time.as_secs() - e.start_time.as_secs()).abs() < 0.03);
+            assert!((a.end_time.as_secs() - e.end_time.as_secs()).abs() < 0.03);
+        }
+    }
+
+    #[test]
+    fn stats_count_speech_and_silence_frames() {
+        #[derive(Default)]
+        struct Capture(StdMutex<Vec<VadStats>>);
+        impl VadMetricsCollector for Capture {
+            fn record_vad_metrics(&self, snapshot: &VadMetricsSnapshot) {
+                self.0.lock().unwrap().push(snapshot.stats);
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let detector = VadDetector::with_metrics(VadConfig::default(), capture.clone()).unwrap();
+        detector.detect(&tone_burst(0.5, 1.0)).unwrap();
+
+        let stats = capture.0.lock().unwrap()[0];
+        assert_eq!(
+            stats.frames_processed,
+            stats.speech_frames + stats.silence_frames
+        );
+        // Roughly half of the 2 s input is the tone.
+        let ratio = stats.speech_ratio();
+        assert!((0.4..0.6).contains(&ratio), "speech ratio {ratio}");
+    }
+
+    #[test]
+    fn reset_restarts_timestamps() {
+        let mut detector = VadDetector::new(VadConfig::default()).unwrap();
+        let audio = tone_burst(0.5, 1.0);
+        let first = detector.detect(&audio).unwrap();
+
+        detector.reset(AudioTimestamp::EPOCH);
+        let second = detector.detect(&audio).unwrap();
+        assert_eq!(first, second);
     }
 }

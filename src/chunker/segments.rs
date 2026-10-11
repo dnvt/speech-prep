@@ -7,7 +7,6 @@ use super::planner::plan_chunk_sizes;
 use super::{ChunkBoundary, Chunker, ProcessedChunk};
 use crate::SpeechChunk;
 
-#[allow(clippy::multiple_inherent_impl)]
 impl Chunker {
     pub(crate) fn create_silence_chunk(
         audio: &[f32],

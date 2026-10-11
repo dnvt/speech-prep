@@ -5,10 +5,8 @@ use crate::time::AudioTimestamp;
 use super::Chunker;
 use crate::SpeechChunk;
 
-#[allow(clippy::multiple_inherent_impl)]
 impl Chunker {
     /// Compute noise baseline from silence regions for SNR calculation.
-    #[allow(clippy::cognitive_complexity)]
     pub(crate) fn compute_noise_baseline(
         audio: &[f32],
         sample_rate: u32,

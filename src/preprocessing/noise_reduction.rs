@@ -1,135 +1,54 @@
-//! Noise reduction via spectral subtraction.
+//! Stationary noise reduction by spectral subtraction.
 //!
-//! Reduces background noise while preserving speech intelligibility using
-//! adaptive spectral subtraction with VAD-informed noise profiling.
+//! The reducer runs a short-time Fourier transform (STFT), learns an average
+//! noise magnitude spectrum from frames marked as silence, subtracts it from
+//! every frame, and resynthesizes with the original phase.
 //!
-//! # Capabilities
+//! This works for steady background noise such as fans, HVAC, hum, or hiss.
+//! It does not help with non-stationary interference (other voices, music,
+//! clicks) and does not remove reverb. Aggressive settings produce "musical
+//! noise"; the spectral floor limits that.
 //!
-//! - **Stationary Noise Reduction**: Effectively removes constant background
-//!   noise (HVAC hum, white noise, fan noise, café ambience)
-//! - **≥6 dB SNR Improvement**: Validated on white noise, low-frequency hum,
-//!   and ambient café noise
-//! - **Phase Preservation**: Maintains speech intelligibility by preserving
-//!   original signal phase
-//! - **VAD Integration**: Adapts noise profile only during detected silence
-//! - **Real-Time**: <15ms latency per 500ms chunk (typically 0.2-0.3ms)
-//!
-//! # Limitations
-//!
-//! **Spectral subtraction is designed for STATIONARY noise only.**
-//!
-//! - **Non-stationary noise**: Struggles with time-varying noise (individual
-//!   voices, music, babble with distinct speakers). Use Wiener filtering or
-//!   deep learning approaches for non-stationary scenarios.
-//! - **Speech-like interference**: Cannot separate overlapping speakers or
-//!   remove foreground speech interference (requires source separation
-//!   techniques).
-//! - **Musical noise artifacts**: Tonal artifacts may occur with aggressive
-//!   settings. Mitigated via spectral floor parameter (β=0.02 default).
-//! - **Transient noise**: Impulsive sounds (door slams, clicks) are not handled
-//!   well. Consider median filtering for transient suppression.
-//!
-//! # When to Use This
-//!
-//! ✅ **Good fit**:
-//! - Background HVAC/fan noise
-//! - Café/restaurant ambient noise (general chatter blur, dishes)
-//! - Low-frequency hum (electrical interference)
-//! - Stationary white/pink noise
-//!
-//! ❌ **Poor fit**:
-//! - Multi-speaker separation (babble with distinct voices)
-//! - Music removal
-//! - Non-stationary interference
-//! - Echo/reverb reduction (use AEC instead)
+//! The noise profile is only learned when the caller passes a
+//! [`VadContext`] with `is_silence: true`. Without that, the reducer has no
+//! noise estimate and passes audio through almost unchanged.
 
 use std::f32::consts::PI;
 use std::sync::Arc;
 
+use realfft::num_complex::Complex;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+
 use super::VadContext;
 use crate::error::{Error, Result};
-use crate::time::{AudioDuration, AudioInstant};
-use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-use tracing::{info, warn};
 
-/// Configuration for noise reduction via spectral subtraction.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use speech_prep::preprocessing::NoiseReductionConfig;
-///
-/// // Default: 25ms window, 10ms hop, α=2.0, β=0.02
-/// let config = NoiseReductionConfig::default();
-///
-/// // Aggressive noise removal for noisy environment
-/// let config = NoiseReductionConfig {
-///     oversubtraction_factor: 2.5,
-///     spectral_floor: 0.01,
-///     ..Default::default()
-/// };
-/// # Ok::<(), speech_prep::error::Error>(())
-/// ```
+/// Configuration for [`NoiseReducer`].
 #[derive(Debug, Clone)]
-#[allow(missing_copy_implementations)]
 pub struct NoiseReductionConfig {
-    /// Sample rate in Hz.
-    ///
-    /// **Default**: 16000
-    /// **Range**: 8000-48000
+    /// Sample rate in Hz, 8000-48000. Default: 16000.
     pub sample_rate_hz: u32,
 
-    /// STFT window duration in milliseconds.
-    ///
-    /// **Default**: 25.0
-    /// **Range**: 10.0-50.0
-    ///
-    /// **Effect**: Longer windows improve frequency resolution but reduce
-    /// time resolution. 25ms captures 1-3 pitch periods for typical speech.
+    /// STFT window length in milliseconds, 10-50. Default: 25.
     pub window_ms: f32,
 
-    /// STFT hop duration in milliseconds.
-    ///
-    /// **Default**: 10.0
-    /// **Range**: 5.0-25.0
-    ///
-    /// **Effect**: Smaller hops increase overlap (smoother reconstruction)
-    /// but require more computation. 10ms hop = 60% overlap with 25ms window.
+    /// STFT hop in milliseconds; must be shorter than the window.
+    /// Default: 10.
     pub hop_ms: f32,
 
-    /// Oversubtraction factor (α).
+    /// Over-subtraction factor (alpha), 1.0-3.0. Default: 2.0.
     ///
-    /// **Default**: 2.0
-    /// **Range**: 1.0-3.0
-    ///
-    /// **Effect**: Multiplier for noise estimate in spectral subtraction.
-    /// - Higher: More aggressive noise removal, more artifacts
-    /// - Lower: Conservative removal, less SNR gain
+    /// Higher values remove more noise and introduce more artifacts.
     pub oversubtraction_factor: f32,
 
-    /// Spectral floor (β) as fraction of noise estimate.
-    ///
-    /// **Default**: 0.02 (2% of noise estimate)
-    /// **Range**: 0.001-0.1
-    ///
-    /// **Effect**: Minimum magnitude after subtraction to prevent musical
-    /// noise. Acts as a noise gate.
+    /// Spectral floor (beta) as a fraction of the noise estimate,
+    /// 0.001-0.1. Default: 0.02.
     pub spectral_floor: f32,
 
-    /// Noise profile smoothing factor (`α_noise`).
-    ///
-    /// **Default**: 0.98
-    /// **Range**: 0.9-0.999
-    ///
-    /// **Effect**: Exponential moving average smoothing for noise profile.
-    /// Higher values = slower adaptation, more stable estimate.
+    /// Smoothing factor for the noise profile, in `[0.9, 1.0)`.
+    /// Default: 0.98. Higher values adapt more slowly.
     pub noise_smoothing: f32,
 
-    /// Enable noise reduction.
-    ///
-    /// **Default**: true
-    ///
-    /// **Effect**: When false, audio passes through unmodified (bypass mode).
+    /// Set to `false` to pass audio through unchanged. Default: true.
     pub enable: bool,
 }
 
@@ -148,57 +67,50 @@ impl Default for NoiseReductionConfig {
 }
 
 impl NoiseReductionConfig {
-    /// Validate configuration parameters.
+    /// Check that every field is within its documented range.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Configuration` if:
-    /// - `sample_rate_hz` not in 8000-48000 Hz
-    /// - `window_ms` not in 10.0-50.0 ms
-    /// - `hop_ms` >= `window_ms` (overlap required)
-    /// - `oversubtraction_factor` not in 1.0-3.0
-    /// - `spectral_floor` not in 0.001-0.1
-    /// - `noise_smoothing` not in 0.9-0.999
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    /// Returns [`Error::Configuration`] naming the first invalid field.
     pub fn validate(&self) -> Result<()> {
         if !(8000..=48_000).contains(&self.sample_rate_hz) {
             return Err(Error::Configuration(format!(
-                "Invalid sample rate: {} Hz (range: 8000-48000)",
+                "sample_rate_hz {} must be in 8000-48000",
                 self.sample_rate_hz
             )));
         }
 
         if !(10.0..=50.0).contains(&self.window_ms) {
             return Err(Error::Configuration(format!(
-                "Invalid window size: {:.1} ms (range: 10-50)",
+                "window_ms {:.1} must be in 10-50",
                 self.window_ms
             )));
         }
 
-        if self.hop_ms >= self.window_ms {
+        if self.hop_ms <= 0.0 || self.hop_ms >= self.window_ms {
             return Err(Error::Configuration(format!(
-                "Hop {:.1} ms must be < window {:.1} ms",
+                "hop_ms {:.1} must be positive and shorter than window_ms {:.1}",
                 self.hop_ms, self.window_ms
             )));
         }
 
         if !(1.0..=3.0).contains(&self.oversubtraction_factor) {
             return Err(Error::Configuration(format!(
-                "Invalid oversubtraction factor: {:.2} (range: 1.0-3.0)",
+                "oversubtraction_factor {:.2} must be in 1.0-3.0",
                 self.oversubtraction_factor
             )));
         }
 
         if !(0.001..=0.1).contains(&self.spectral_floor) {
             return Err(Error::Configuration(format!(
-                "Invalid spectral floor: {:.3} (range: 0.001-0.1)",
+                "spectral_floor {:.3} must be in 0.001-0.1",
                 self.spectral_floor
             )));
         }
 
         if !(0.9..1.0).contains(&self.noise_smoothing) {
             return Err(Error::Configuration(format!(
-                "Invalid noise smoothing: {:.3} (range: 0.9-0.999)",
+                "noise_smoothing {:.3} must be in [0.9, 1.0)",
                 self.noise_smoothing
             )));
         }
@@ -206,59 +118,48 @@ impl NoiseReductionConfig {
         Ok(())
     }
 
-    /// Calculate frame length in samples.
+    /// STFT window length in samples.
+    #[must_use]
     pub fn frame_length(&self) -> usize {
         ((self.window_ms / 1000.0) * self.sample_rate_hz as f32).round() as usize
     }
 
-    /// Calculate hop length in samples.
+    /// STFT hop length in samples.
+    #[must_use]
     pub fn hop_length(&self) -> usize {
         ((self.hop_ms / 1000.0) * self.sample_rate_hz as f32).round() as usize
     }
 
-    /// Calculate FFT size (next power of 2 >= frame length).
+    /// FFT size: the next power of two at or above the frame length.
+    #[must_use]
     pub fn fft_size(&self) -> usize {
         self.frame_length().next_power_of_two()
     }
 }
 
-/// Noise reduction via spectral subtraction with adaptive noise profiling.
+/// Spectral-subtraction noise reducer with a VAD-gated noise profile.
 ///
-/// Implements the noise reduction specification:
-/// - STFT-based processing (25ms window, 10ms hop)
-/// - Adaptive noise profile estimation during VAD-detected silence
-/// - Magnitude-only spectral subtraction (preserves phase)
-/// - Achieves ≥6 dB SNR improvement target
+/// Each call to [`reduce`](Self::reduce) returns exactly as many samples as it
+/// was given. The noise profile persists across calls; call
+/// [`reset`](Self::reset) when switching to an unrelated stream.
 ///
-/// # Performance
-///
-/// - **Target**: <15ms per 500ms chunk (8000 samples @ 16kHz)
-/// - **Expected**: ~7ms (2x headroom)
-/// - **Optimization**: Precomputed FFT plans, reused buffers
-///
-/// # Example
-///
-/// ```rust,no_run
+/// ```
 /// use speech_prep::preprocessing::{NoiseReducer, NoiseReductionConfig, VadContext};
 ///
-/// # fn main() -> speech_prep::error::Result<()> {
-/// let config = NoiseReductionConfig::default();
-/// let mut reducer = NoiseReducer::new(config)?;
-/// let audio_stream = vec![vec![0.0; 8000], vec![0.05; 8080]];
+/// # fn main() -> speech_prep::Result<()> {
+/// let mut reducer = NoiseReducer::new(NoiseReductionConfig::default())?;
 ///
-/// // Process streaming chunks with VAD context
-/// for chunk in audio_stream {
-///     let vad_ctx = VadContext { is_silence: detect_silence(&chunk) };
-///     let _denoised = reducer.reduce(&chunk, Some(vad_ctx))?;
-/// }
+/// // Learn the noise floor from a silent stretch...
+/// let room_tone = vec![0.001; 8000];
+/// reducer.reduce(&room_tone, Some(VadContext { is_silence: true }))?;
+///
+/// // ...then clean speech.
+/// let speech = vec![0.1; 8000];
+/// let cleaned = reducer.reduce(&speech, Some(VadContext { is_silence: false }))?;
+/// assert_eq!(cleaned.len(), speech.len());
 /// # Ok(())
 /// # }
-/// #
-/// # fn detect_silence(chunk: &[f32]) -> bool {
-/// #     chunk.iter().all(|sample| sample.abs() < 1e-3)
-/// # }
 /// ```
-#[allow(missing_copy_implementations)]
 pub struct NoiseReducer {
     config: NoiseReductionConfig,
     fft_forward: Arc<dyn RealToComplex<f32>>,
@@ -266,7 +167,6 @@ pub struct NoiseReducer {
     window: Vec<f32>,
     noise_profile: Vec<f32>,
     noise_initialized: bool,
-    overlap_buffer: Vec<f32>,
 }
 
 impl std::fmt::Debug for NoiseReducer {
@@ -280,325 +180,115 @@ impl std::fmt::Debug for NoiseReducer {
     }
 }
 
+/// Initial noise magnitude per bin, before any silence has been observed.
+const INITIAL_NOISE_MAGNITUDE: f32 = 1e-6;
+
+/// Below this window-energy sum a sample is considered uncovered by the STFT
+/// and is passed through instead of divided by a near-zero weight.
+const MIN_WINDOW_WEIGHT: f32 = 1e-3;
+
 impl NoiseReducer {
-    /// Create a new noise reducer.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration parameters (window size, hop, α, β)
+    /// Create a reducer from a validated configuration.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Configuration` if configuration is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use speech_prep::preprocessing::{NoiseReducer, NoiseReductionConfig};
-    ///
-    /// let config = NoiseReductionConfig {
-    ///     oversubtraction_factor: 2.5, // Aggressive
-    ///     ..Default::default()
-    /// };
-    /// let reducer = NoiseReducer::new(config)?;
-    /// # Ok::<(), speech_prep::error::Error>(())
-    /// ```
+    /// Returns [`Error::Configuration`] if `config` is invalid.
     pub fn new(config: NoiseReductionConfig) -> Result<Self> {
         config.validate()?;
 
         let fft_size = config.fft_size();
-        let frame_length = config.frame_length();
-
         let mut planner = RealFftPlanner::<f32>::new();
         let fft_forward = planner.plan_fft_forward(fft_size);
         let fft_inverse = planner.plan_fft_inverse(fft_size);
 
-        let window = generate_hann_window(frame_length);
-
-        let num_bins = fft_size / 2 + 1;
-        let noise_profile = vec![1e-6; num_bins];
-
-        let overlap_buffer = vec![0.0; frame_length];
-
         Ok(Self {
+            window: generate_hann_window(config.frame_length()),
+            noise_profile: vec![INITIAL_NOISE_MAGNITUDE; fft_size / 2 + 1],
+            noise_initialized: false,
             config,
             fft_forward,
             fft_inverse,
-            window,
-            noise_profile,
-            noise_initialized: false,
-            overlap_buffer,
         })
     }
 
-    /// Apply noise reduction to audio samples.
+    /// Denoise one chunk of samples.
     ///
-    /// # Arguments
+    /// If `vad_context` marks the chunk as silence, its full frames also
+    /// update the noise profile before subtraction.
     ///
-    /// * `samples` - Input audio samples (typically 500ms chunk = 8000 samples
-    ///   @ 16kHz)
-    /// * `vad_context` - Optional VAD state for noise profile updates
+    /// # Errors
     ///
-    /// # Returns
-    ///
-    /// Denoised audio with ≥6 dB SNR improvement on noisy input.
-    ///
-    /// # Performance
-    ///
-    /// - Expected: ~7ms for 8000 samples (2x better than <15ms target)
-    /// - Complexity: O(n log n) for FFT operations
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use speech_prep::preprocessing::{NoiseReducer, NoiseReductionConfig, VadContext};
-    ///
-    /// let mut reducer = NoiseReducer::new(NoiseReductionConfig::default())?;
-    ///
-    /// // Chunk 1 (silence - initialize noise profile)
-    /// let chunk1 = vec![0.001; 8000];
-    /// let vad1 = VadContext { is_silence: true };
-    /// let output1 = reducer.reduce(&chunk1, Some(vad1))?;
-    ///
-    /// // Chunk 2 (speech - apply noise reduction)
-    /// let chunk2 = vec![0.1; 8000];
-    /// let vad2 = VadContext { is_silence: false };
-    /// let output2 = reducer.reduce(&chunk2, Some(vad2))?;
-    /// # Ok::<(), speech_prep::error::Error>(())
-    /// ```
-    #[allow(clippy::unnecessary_wraps)]
+    /// Returns [`Error::Processing`] if an FFT call fails.
     pub fn reduce(&mut self, samples: &[f32], vad_context: Option<VadContext>) -> Result<Vec<f32>> {
-        let processing_start = AudioInstant::now();
-
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-
         if !self.config.enable {
             return Ok(samples.to_vec());
         }
 
-        let (mut output, frame_count) = self.process_stft_frames(samples, vad_context)?;
-        self.normalize_overlap_add(&mut output);
-
-        let elapsed = elapsed_duration(processing_start);
-        let latency_ms = elapsed.as_secs_f64() * 1000.0;
-        self.record_performance_metrics(samples, &output, latency_ms, frame_count);
-
-        Ok(output)
-    }
-
-    /// Process audio through STFT frames with spectral subtraction.
-    fn process_stft_frames(
-        &mut self,
-        samples: &[f32],
-        vad_context: Option<VadContext>,
-    ) -> Result<(Vec<f32>, usize)> {
-        let frame_length = self.config.frame_length();
+        let frame_length = self.window.len();
         let hop_length = self.config.hop_length();
+        let is_silence = vad_context.is_some_and(|ctx| ctx.is_silence);
 
-        let mut output = vec![0.0; samples.len()];
-        let mut frame_idx = 0;
+        // Pad by one frame on each side so every input sample is covered by
+        // the same number of overlapping windows. Without this the first and
+        // last frame of each chunk fade towards zero.
+        let pad = frame_length;
+        let padded_len = samples.len() + 2 * pad;
+        let mut output = vec![0.0f32; padded_len];
+        let mut weight = vec![0.0f32; padded_len];
+
+        let mut frame = vec![0.0f32; frame_length];
         let mut pos = 0;
-
-        while pos < samples.len() {
-            let remaining = samples.len() - pos;
-
-            let frame = Self::extract_frame(samples, pos, frame_length, remaining)?;
-
-            let processed =
-                self.process_single_frame(&frame, vad_context, remaining >= frame_length)?;
-
-            Self::accumulate_frame_output(&processed, &mut output, pos);
-
-            frame_idx += 1;
-
-            if remaining < hop_length {
-                break;
+        while pos + frame_length <= padded_len {
+            for (i, slot) in frame.iter_mut().enumerate() {
+                let idx = pos + i;
+                *slot = if (pad..pad + samples.len()).contains(&idx) {
+                    samples.get(idx - pad).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
             }
+
+            let fully_inside = pos >= pad && pos + frame_length <= pad + samples.len();
+            let processed = self.process_frame(&frame, is_silence && fully_inside)?;
+
+            for (i, (&s, &w)) in processed.iter().zip(&self.window).enumerate() {
+                if let (Some(out), Some(wsum)) = (output.get_mut(pos + i), weight.get_mut(pos + i))
+                {
+                    *out += s;
+                    *wsum = w.mul_add(w, *wsum);
+                }
+            }
+
             pos += hop_length;
         }
 
-        Ok((output, frame_idx))
-    }
-
-    /// Extract a frame from the input samples, zero-padding if partial.
-    fn extract_frame(
-        samples: &[f32],
-        pos: usize,
-        frame_length: usize,
-        remaining: usize,
-    ) -> Result<Vec<f32>> {
-        let mut frame_buf = vec![0.0; frame_length];
-
-        if remaining >= frame_length {
-            let src = samples
-                .get(pos..pos + frame_length)
-                .ok_or_else(|| Error::Processing("frame window out of bounds".into()))?;
-            frame_buf.copy_from_slice(src);
-        } else {
-            let src = samples
-                .get(pos..)
-                .ok_or_else(|| Error::Processing("frame tail out of bounds".into()))?;
-            if let Some(dst) = frame_buf.get_mut(..remaining) {
-                dst.copy_from_slice(src);
-            }
-        }
-
-        Ok(frame_buf)
-    }
-
-    /// Process a single frame through FFT, spectral subtraction, and IFFT.
-    fn process_single_frame(
-        &mut self,
-        frame: &[f32],
-        vad_context: Option<VadContext>,
-        is_full_frame: bool,
-    ) -> Result<Vec<f32>> {
-        let fft_size = self.config.fft_size();
-
-        let windowed: Vec<f32> = frame
+        let result = samples
             .iter()
-            .zip(&self.window)
-            .map(|(&s, &w)| s * w)
-            .collect();
-
-        let complex_spectrum = self.forward_fft_complex(&windowed)?;
-        let magnitudes: Vec<f32> = complex_spectrum.iter().map(|c| c.norm()).collect();
-
-        let is_silence = vad_context.is_some_and(|ctx| ctx.is_silence);
-        if is_silence && is_full_frame {
-            self.update_noise_profile(&magnitudes);
-        }
-
-        let cleaned_magnitudes = self.spectral_subtract(&magnitudes);
-
-        let cleaned_complex =
-            Self::reconstruct_complex_spectrum(&complex_spectrum, &cleaned_magnitudes);
-
-        let time_signal = self.inverse_fft_complex(&cleaned_complex, fft_size)?;
-
-        let windowed_output: Vec<f32> = time_signal
-            .iter()
-            .take(frame.len())
-            .zip(&self.window)
-            .map(|(&s, &w)| s * w)
-            .collect();
-
-        Ok(windowed_output)
-    }
-
-    /// Reconstruct complex spectrum preserving phase from original signal.
-    fn reconstruct_complex_spectrum(
-        original_spectrum: &[realfft::num_complex::Complex<f32>],
-        cleaned_magnitudes: &[f32],
-    ) -> Vec<realfft::num_complex::Complex<f32>> {
-        original_spectrum
-            .iter()
-            .zip(cleaned_magnitudes)
             .enumerate()
-            .map(|(i, (original, &new_mag))| {
-                if i == 0 || i == original_spectrum.len() - 1 {
-                    // DC and Nyquist bins must be real-valued
-                    realfft::num_complex::Complex::new(new_mag, 0.0)
+            .map(|(i, &original)| {
+                let w = weight.get(pad + i).copied().unwrap_or(0.0);
+                let y = output.get(pad + i).copied().unwrap_or(0.0);
+                if w > MIN_WINDOW_WEIGHT {
+                    y / w
                 } else {
-                    let phase = original.arg();
-                    realfft::num_complex::Complex::from_polar(new_mag, phase)
+                    original
                 }
             })
-            .collect()
+            .collect();
+
+        Ok(result)
     }
 
-    /// Accumulate processed frame into output buffer (overlap-add).
-    fn accumulate_frame_output(frame: &[f32], output: &mut [f32], pos: usize) {
-        for (i, &sample) in frame.iter().enumerate() {
-            let out_idx = pos + i;
-            if let Some(dst) = output.get_mut(out_idx) {
-                *dst += sample;
-            }
-        }
-    }
-
-    /// Normalize output by overlap-add window sum.
-    fn normalize_overlap_add(&self, output: &mut [f32]) {
-        let hop_length = self.config.hop_length();
-        let window_sum = self.calculate_window_overlap_sum(hop_length);
-
-        if window_sum > 1e-6 {
-            for sample in output {
-                *sample /= window_sum;
-            }
-        }
-    }
-
-    fn record_performance_metrics(
-        &self,
-        input: &[f32],
-        output: &[f32],
-        latency_ms: f64,
-        frame_count: usize,
-    ) {
-        if input.len() < 8000 {
-            return;
-        }
-
-        if latency_ms > 15.0 {
-            warn!(
-                target: "audio.preprocess.noise_reduction",
-                latency_ms,
-                samples = input.len(),
-                frames = frame_count,
-                oversubtraction = self.config.oversubtraction_factor,
-                spectral_floor = self.config.spectral_floor,
-                "noise reduction latency exceeded target"
-            );
-        }
-
-        let avg_noise_floor = self.noise_floor().max(1e-12);
-        let noise_floor_db = 20.0 * avg_noise_floor.log10();
-
-        let signal_power_out =
-            output.iter().map(|sample| sample * sample).sum::<f32>() / output.len() as f32;
-        let residual_power: f32 = input
-            .iter()
-            .zip(output)
-            .map(|(&noisy, &clean)| {
-                let residual = noisy - clean;
-                residual * residual
-            })
-            .sum::<f32>()
-            / output.len() as f32;
-
-        let snr_improvement_db = if residual_power > 1e-12 && signal_power_out > 0.0 {
-            10.0 * (signal_power_out / residual_power).log10()
-        } else {
-            0.0
-        };
-
-        info!(
-            target: "audio.preprocess.noise_reduction",
-            noise_floor_db,
-            snr_improvement_db,
-            latency_ms,
-            frames = frame_count,
-            samples = input.len(),
-            oversubtraction = self.config.oversubtraction_factor,
-            spectral_floor = self.config.spectral_floor,
-            "noise reduction metrics"
-        );
-    }
-
-    /// Reset noise profile for new audio stream.
-    ///
-    /// Clears noise estimate and overlap-add state.
-    /// Use this when starting a new, independent audio stream.
+    /// Forget the learned noise profile.
     pub fn reset(&mut self) {
-        self.noise_profile.fill(1e-6);
+        self.noise_profile.fill(INITIAL_NOISE_MAGNITUDE);
         self.noise_initialized = false;
-        self.overlap_buffer.fill(0.0);
     }
 
-    /// Get current average noise floor (for debugging/observability).
+    /// Mean of the noise magnitude spectrum, for diagnostics.
     #[must_use]
     pub fn noise_floor(&self) -> f32 {
         if self.noise_profile.is_empty() {
@@ -607,128 +297,78 @@ impl NoiseReducer {
         self.noise_profile.iter().sum::<f32>() / self.noise_profile.len() as f32
     }
 
-    /// Get current configuration.
+    /// The configuration this reducer was built with.
     #[must_use]
     pub fn config(&self) -> &NoiseReductionConfig {
         &self.config
     }
 
-    // Forward FFT with zero-padding (returns complex spectrum)
-    fn forward_fft_complex(
-        &self,
-        windowed: &[f32],
-    ) -> Result<Vec<realfft::num_complex::Complex<f32>>> {
-        // Prepare input buffer (zero-padded to FFT size)
+    /// Analysis window, FFT, subtraction, inverse FFT, synthesis window.
+    fn process_frame(&mut self, frame: &[f32], update_noise: bool) -> Result<Vec<f32>> {
         let mut input = self.fft_forward.make_input_vec();
-        for (i, &sample) in windowed.iter().enumerate() {
-            if let Some(dst) = input.get_mut(i) {
-                *dst = sample;
-            }
+        for ((dst, &s), &w) in input.iter_mut().zip(frame).zip(&self.window) {
+            *dst = s * w;
         }
 
-        // Perform FFT
         let mut spectrum = self.fft_forward.make_output_vec();
         self.fft_forward
             .process(&mut input, &mut spectrum)
-            .map_err(|e| Error::Processing(format!("FFT failed: {e}")))?;
+            .map_err(|e| Error::Processing(format!("forward FFT failed: {e}")))?;
 
-        Ok(spectrum)
-    }
-
-    // Inverse FFT from complex spectrum (preserves phase)
-    fn inverse_fft_complex(
-        &self,
-        complex_spectrum: &[realfft::num_complex::Complex<f32>],
-        fft_size: usize,
-    ) -> Result<Vec<f32>> {
-        // Prepare input buffer
-        let mut spectrum = self.fft_inverse.make_input_vec();
-        for (i, &c) in complex_spectrum.iter().enumerate() {
-            if let Some(bin) = spectrum.get_mut(i) {
-                *bin = c;
-            }
+        let magnitudes: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect();
+        if update_noise {
+            self.update_noise_profile(&magnitudes);
         }
 
-        // Perform inverse FFT
-        let mut output = self.fft_inverse.make_output_vec();
+        let alpha = self.config.oversubtraction_factor;
+        let beta = self.config.spectral_floor;
+        let last_bin = spectrum.len() - 1;
+        for (k, ((bin, &mag), &noise)) in spectrum
+            .iter_mut()
+            .zip(&magnitudes)
+            .zip(&self.noise_profile)
+            .enumerate()
+        {
+            let cleaned = alpha.mul_add(-noise, mag).max(beta * noise);
+            *bin = if k == 0 || k == last_bin {
+                // DC and Nyquist bins of a real signal's spectrum are real.
+                Complex::new(cleaned.copysign(bin.re), 0.0)
+            } else {
+                Complex::from_polar(cleaned, bin.arg())
+            };
+        }
+
+        let mut time = self.fft_inverse.make_output_vec();
         self.fft_inverse
-            .process(&mut spectrum, &mut output)
-            .map_err(|e| Error::Processing(format!("IFFT failed: {e}")))?;
+            .process(&mut spectrum, &mut time)
+            .map_err(|e| Error::Processing(format!("inverse FFT failed: {e}")))?;
 
-        // Normalize by FFT size
-        for sample in &mut output {
-            *sample /= fft_size as f32;
-        }
-
-        Ok(output)
+        let scale = 1.0 / self.config.fft_size() as f32;
+        Ok(time
+            .iter()
+            .zip(&self.window)
+            .map(|(&s, &w)| s * scale * w)
+            .collect())
     }
 
-    // Update noise profile using exponential moving average
-    fn update_noise_profile(&mut self, spectrum: &[f32]) {
-        let alpha = self.config.noise_smoothing;
-
+    fn update_noise_profile(&mut self, magnitudes: &[f32]) {
         if self.noise_initialized {
-            // EMA update: N_new[k] = α * N_old[k] + (1-α) * |X[k]|
-            for (noise, &current) in self.noise_profile.iter_mut().zip(spectrum.iter()) {
+            let alpha = self.config.noise_smoothing;
+            for (noise, &current) in self.noise_profile.iter_mut().zip(magnitudes) {
                 *noise = alpha.mul_add(*noise, (1.0 - alpha) * current);
             }
         } else {
-            // First silence frame: initialize noise profile
-            self.noise_profile.copy_from_slice(spectrum);
+            self.noise_profile.copy_from_slice(magnitudes);
             self.noise_initialized = true;
         }
     }
-
-    // Apply spectral subtraction: |Y[k]| = max(|X[k]| - α*|N[k]|, β*|N[k]|)
-    fn spectral_subtract(&self, spectrum: &[f32]) -> Vec<f32> {
-        let alpha = self.config.oversubtraction_factor;
-        let beta = self.config.spectral_floor;
-
-        spectrum
-            .iter()
-            .zip(&self.noise_profile)
-            .map(|(&signal, &noise)| {
-                let subtracted = alpha.mul_add(-noise, signal);
-                let floor = beta * noise;
-                subtracted.max(floor)
-            })
-            .collect()
-    }
-
-    // Calculate window overlap sum for COLA normalization
-    fn calculate_window_overlap_sum(&self, hop_length: usize) -> f32 {
-        let frame_length = self.window.len();
-        let mut sum: f32 = 0.0;
-
-        // Sum overlapping windows at each sample position
-        for i in 0..frame_length {
-            let mut overlap: f32 = 0.0;
-            let mut offset = 0;
-
-            while offset <= i {
-                if let Some(&w) = self.window.get(i - offset) {
-                    overlap = w.mul_add(w, overlap); // Window applied twice
-                                                     // (analysis +
-                                                     // synthesis)
-                }
-                offset += hop_length;
-            }
-
-            sum = sum.max(overlap);
-        }
-
-        sum
-    }
 }
 
-/// Generate Hann window.
-///
-/// Formula: `w[n] = 0.5 - 0.5 * cos(2π * n / (N-1))`
+/// Symmetric Hann window: `w[n] = 0.5 - 0.5 * cos(2πn / (N - 1))`.
 fn generate_hann_window(length: usize) -> Vec<f32> {
     if length == 0 {
         return Vec::new();
     }
-
     if length == 1 {
         return vec![1.0];
     }
@@ -742,10 +382,6 @@ fn generate_hann_window(length: usize) -> Vec<f32> {
         .collect()
 }
 
-fn elapsed_duration(start: AudioInstant) -> AudioDuration {
-    AudioInstant::now().duration_since(start)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,7 +389,6 @@ mod tests {
     type TestResult<T> = std::result::Result<T, String>;
 
     #[test]
-    #[allow(clippy::unnecessary_wraps)]
     fn test_configuration_validation() -> TestResult<()> {
         // Valid configuration
         let valid = NoiseReductionConfig::default();
@@ -1246,6 +881,30 @@ mod tests {
             "Speech energy collapsed without VAD context (rms={output_rms})"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_without_noise_profile() -> TestResult<()> {
+        // With no silence observed the noise estimate is ~0, so the STFT
+        // round trip should reconstruct the input, including chunk edges.
+        let mut reducer =
+            NoiseReducer::new(NoiseReductionConfig::default()).map_err(|e| e.to_string())?;
+        let input = generate_sine_wave(300.0, 16000, 1.0, 0.5);
+
+        let mut output = Vec::new();
+        for chunk in input.chunks(8000) {
+            let speech = Some(VadContext { is_silence: false });
+            output.extend(reducer.reduce(chunk, speech).map_err(|e| e.to_string())?);
+        }
+
+        assert_eq!(output.len(), input.len());
+        let max_err = input
+            .iter()
+            .zip(&output)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "max reconstruction error {max_err}");
         Ok(())
     }
 }

@@ -1,40 +1,25 @@
-//! Audio normalization with RMS targeting and peak limiting.
-//!
-//! This module provides intelligent audio level normalization that:
-//! - Targets a configurable RMS level (e.g., -20 dBFS)
-//! - Prevents clipping with hard peak limiting at ±1.0
-//! - Enforces maximum gain ceiling to avoid over-amplification
-//! - Handles silence and very quiet audio gracefully
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use speech_prep::preprocessing::Normalizer;
-//!
-//! # fn main() -> speech_prep::error::Result<()> {
-//! let normalizer = Normalizer::new(0.5, 10.0)?;
-//! let quiet_audio = vec![0.1f32; 1000];
-//! let normalized = normalizer.normalize(&quiet_audio)?;
-//! # Ok(())
-//! # }
-//! ```
+//! RMS loudness normalization with a gain cap and hard limiting.
 
 use crate::error::{Error, Result};
-use crate::time::{AudioDuration, AudioInstant};
-use tracing::{debug, trace};
 
-/// Audio normalizer with RMS targeting and peak limiting.
+/// Scales audio towards a target RMS level.
 ///
-/// # Configuration
+/// The gain is `target_rms / rms(input)`, capped at `max_gain` so that quiet
+/// noise is not boosted into something loud. Samples that would exceed
+/// ±1.0 after gain are hard-clipped, so pick a target with headroom (0.1,
+/// about -20 dBFS, is a reasonable choice for speech).
 ///
-/// - `target_rms`: Desired RMS level in range [0.0, 1.0] (e.g., 0.5 for -6
-///   dBFS)
-/// - `max_gain`: Maximum gain multiplier to prevent over-amplification (e.g.,
-///   10.0)
+/// ```
+/// use speech_prep::preprocessing::Normalizer;
 ///
-/// # Safety
-///
-/// All output samples are hard-clamped to [-1.0, 1.0] to prevent clipping.
+/// # fn main() -> speech_prep::Result<()> {
+/// let normalizer = Normalizer::new(0.1, 10.0)?;
+/// let quiet = vec![0.02f32; 1000];
+/// let louder = normalizer.normalize(&quiet)?;
+/// assert!((louder[0] - 0.1).abs() < 1e-6);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Normalizer {
     target_rms: f32,
@@ -42,26 +27,20 @@ pub struct Normalizer {
 }
 
 impl Normalizer {
-    /// Creates a new normalizer with the given target RMS and max gain.
-    ///
-    /// # Arguments
-    ///
-    /// - `target_rms`: Target RMS level in [0.0, 1.0]
-    /// - `max_gain`: Maximum gain multiplier (must be positive)
+    /// Create a normalizer.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if:
-    /// - `target_rms` is not in [0.0, 1.0]
-    /// - `max_gain` is not positive
+    /// Returns [`Error::Configuration`] if `target_rms` is outside
+    /// `[0.0, 1.0]` or `max_gain` is not positive.
     pub fn new(target_rms: f32, max_gain: f32) -> Result<Self> {
         if !(0.0..=1.0).contains(&target_rms) {
-            return Err(Error::InvalidInput(
-                "target_rms must be in range [0.0, 1.0]".into(),
+            return Err(Error::Configuration(
+                "target_rms must be in [0.0, 1.0]".into(),
             ));
         }
-        if max_gain <= 0.0 {
-            return Err(Error::InvalidInput("max_gain must be positive".into()));
+        if max_gain.is_nan() || max_gain <= 0.0 {
+            return Err(Error::Configuration("max_gain must be positive".into()));
         }
         Ok(Self {
             target_rms,
@@ -69,116 +48,43 @@ impl Normalizer {
         })
     }
 
-    /// Normalizes audio samples to the target RMS level.
-    ///
-    /// # Arguments
-    ///
-    /// - `samples`: Input audio samples
-    ///
-    /// # Returns
-    ///
-    /// Normalized audio with target RMS level, all samples in [-1.0, 1.0].
+    /// Return a gain-adjusted copy of `samples`. Digital silence is returned
+    /// unchanged.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidInput` if samples are empty.
-    #[tracing::instrument(skip(samples), fields(sample_count = samples.len()))]
+    /// Returns [`Error::InvalidInput`] if `samples` is empty.
     pub fn normalize(self, samples: &[f32]) -> Result<Vec<f32>> {
         if samples.is_empty() {
             return Err(Error::InvalidInput("cannot normalize empty audio".into()));
         }
 
-        let processing_start = AudioInstant::now();
         let current_rms = Self::calculate_rms(samples);
-
         if current_rms < 1e-10 {
-            trace!(
-                current_rms,
-                "audio is silence or near-silence, no normalization applied"
-            );
-            let _elapsed = elapsed_duration(processing_start);
             return Ok(samples.to_vec());
         }
 
-        let raw_gain = self.target_rms / current_rms;
-        let gain = raw_gain.min(self.max_gain);
-        let gain_limited = raw_gain > self.max_gain;
-
-        let (output, clipped_samples) = Self::apply_gain_with_limiting(samples, gain);
-
-        Self::log_normalization_metrics(
-            current_rms,
-            self.target_rms,
-            gain,
-            gain_limited,
-            clipped_samples,
-        );
-
-        let _elapsed = elapsed_duration(processing_start);
-
-        Ok(output)
-    }
-
-    /// Applies gain to samples with peak limiting at [-1.0, 1.0].
-    ///
-    /// Returns the normalized samples and count of clipped samples.
-    fn apply_gain_with_limiting(samples: &[f32], gain: f32) -> (Vec<f32>, usize) {
-        let mut clipped_samples = 0usize;
-        let output: Vec<f32> = samples
+        let gain = (self.target_rms / current_rms).min(self.max_gain);
+        let mut clipped = 0usize;
+        let output = samples
             .iter()
             .map(|&s| {
                 let amplified = s * gain;
                 if amplified.abs() > 1.0 {
-                    clipped_samples += 1;
+                    clipped += 1;
                 }
                 amplified.clamp(-1.0, 1.0)
             })
             .collect();
-        (output, clipped_samples)
+
+        tracing::trace!(current_rms, gain, clipped, "normalized audio");
+        Ok(output)
     }
 
-    fn log_normalization_metrics(
-        current_rms: f32,
-        target_rms: f32,
-        gain: f32,
-        gain_limited: bool,
-        clipped_samples: usize,
-    ) {
-        let gain_db = 20.0 * gain.log10();
-
-        if gain_db > 6.0 {
-            debug!(
-                current_rms,
-                target_rms,
-                gain,
-                gain_db,
-                gain_limited,
-                clipped_samples,
-                "high gain applied during normalization"
-            );
-        } else {
-            trace!(
-                current_rms,
-                target_rms,
-                gain,
-                gain_db,
-                gain_limited,
-                clipped_samples,
-                "normalization complete"
-            );
-        }
-    }
-
-    /// Calculates the root-mean-square (RMS) of the input samples.
     fn calculate_rms(samples: &[f32]) -> f32 {
         let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
-        let mean_square = sum_squares / samples.len() as f32;
-        mean_square.sqrt()
+        (sum_squares / samples.len() as f32).sqrt()
     }
-}
-
-fn elapsed_duration(start: AudioInstant) -> AudioDuration {
-    AudioInstant::now().duration_since(start)
 }
 
 #[cfg(test)]
