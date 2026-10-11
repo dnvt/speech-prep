@@ -401,7 +401,9 @@ impl VadDetector {
             .start_sample
             .saturating_sub(self.padding_samples)
             .max(prev_end);
-        let end = (segment.last_end_sample + self.padding_samples)
+        let end = segment
+            .last_end_sample
+            .saturating_add(self.padding_samples)
             .min(chunk_end_sample.max(segment.start_sample + 1));
         let start_time = self.absolute_time_for_sample(start)?;
         let end_time = self.absolute_time_for_sample(end)?;
