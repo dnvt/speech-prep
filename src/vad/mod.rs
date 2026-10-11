@@ -1,8 +1,9 @@
 //! Voice activity detection.
 //!
-//! [`VadDetector`] combines frame energy and spectral flux against adaptive
-//! baselines and returns speech segments as [`SpeechChunk`]s. It keeps state
-//! between calls, so you can feed a stream block by block.
+//! [`VadDetector`] compares the energy of short frames with a running
+//! estimate of the background level and returns speech segments as
+//! [`SpeechChunk`]s. It keeps state between calls, so you can feed a stream
+//! block by block.
 //!
 //! ```
 //! use speech_prep::{VadConfig, VadDetector};
@@ -24,11 +25,11 @@
 //! ```
 //!
 //! This is a signal-level detector. It does not distinguish speech from other
-//! sounds with similar energy and spectral change, such as music. The first
-//! 300 ms of a stream are used to estimate the background level, so a
-//! perfectly steady sound present from the first sample (a test tone, a hum)
-//! counts as background; speech starting at the first sample is still
-//! detected through the dips between syllables.
+//! sounds that rise above the background just as much, such as music or a
+//! door slam. The first 300 ms of a stream are used to estimate the
+//! background level, so a perfectly steady sound present from the first
+//! sample (a test tone, a hum) counts as background; speech starting at the
+//! first sample is still detected through the dips between syllables.
 
 pub mod config;
 pub mod detector;
@@ -36,7 +37,4 @@ pub mod metrics;
 
 pub use config::VadConfig;
 pub use detector::{SpeechChunk, VadDetector};
-pub use metrics::{
-    AdaptiveThresholdSnapshot, NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot,
-    VadStats,
-};
+pub use metrics::{NoopVadMetricsCollector, VadMetricsCollector, VadMetricsSnapshot, VadStats};

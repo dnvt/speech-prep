@@ -71,7 +71,7 @@ fn main() -> speech_prep::Result<()> {
 | Module | What it does |
 |--------|--------------|
 | `converter` | Decode, downmix, and resample to 16 kHz mono `f32` |
-| `vad` | Voice activity detection from frame energy and spectral flux, with adaptive thresholds |
+| `vad` | Voice activity detection from frame energy against a tracked noise floor |
 | `chunker` | Split audio into ~500 ms chunks aligned to speech, with overlap context |
 | `preprocessing` | DC removal, Butterworth high-pass, spectral-subtraction denoising, RMS normalization, quality metrics |
 | `pipeline` | All of the above, streaming |
@@ -107,7 +107,7 @@ accepted.
   16 kHz output keeps the speech band but not the top of the spectrum.
 - **VAD** is signal-based. It is fast and needs no model, but it can trigger
   on non-speech sounds like music or typing. Tune it with `VadConfig`
-  (`hangover_frames`, `speech_padding`, `min_speech_energy`).
+  (`activation_ratio`, `hangover_frames`, `speech_padding`).
 - **Noise reduction** handles steady noise (fans, hum, hiss). It won't
   remove other voices, music, or reverb.
 - **The pipeline** runs at 16 kHz, and `process_bytes` decodes its whole
