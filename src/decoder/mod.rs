@@ -5,22 +5,28 @@ mod resampler;
 
 use std::io::Cursor;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
+use symphonia::core::audio::Channels;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::CODEC_ID_NULL_AUDIO;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 pub(crate) use mixer::ChannelMixer;
 pub(crate) use resampler::SampleRateConverter;
 
 use crate::error::{Error, Result};
+use crate::format::AudioFormat;
 
 /// Decoded audio before mixing and resampling.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DecodedAudio {
+    /// Codec of the decoded track.
+    pub format: AudioFormat,
     /// Interleaved samples in `[-1.0, 1.0]`.
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -39,9 +45,9 @@ pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudi
 
 /// Run code that calls into Symphonia, turning a panic into an error.
 ///
-/// Symphonia 0.5 panics on some malformed input, for example a Matroska
-/// element with a zero length byte overflows a shift. Audio files are
-/// untrusted input, so a bad file must not take the caller down. This
+/// Audio files are untrusted input, and a decoder bug triggered by a bad
+/// file must not take the caller down. (Symphonia 0.5 panicked on a
+/// Matroska element with a zero length byte; fuzzing keeps checking.) This
 /// cannot help when the application is built with `panic = "abort"`.
 pub(crate) fn catch_decoder_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
@@ -53,7 +59,7 @@ pub(crate) fn catch_decoder_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T>
 
 fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
     let source = MediaSourceStream::new(
-        Box::new(Cursor::new(data.to_vec())),
+        Box::new(Cursor::new(data)),
         MediaSourceStreamOptions::default(),
     );
 
@@ -62,28 +68,30 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut reader = symphonia::default::get_probe()
+        .probe(
             &hint,
             source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|err| Error::InvalidInput(format!("unrecognized or malformed audio: {err}")))?;
-    let mut reader = probed.format;
 
     let (mut track_id, mut decoder) = open_track(reader.as_ref())?;
     let params = decoder.codec_params().clone();
+    let format = AudioFormat::from_codec(params.codec)
+        .ok_or_else(|| Error::Unsupported(format!("codec {}", params.codec)))?;
 
     let mut sample_rate = params.sample_rate;
-    let mut channels = params.channels.map(|c| c.count());
+    let mut channels = params.channels.as_ref().map(Channels::count);
     let mut samples = Vec::new();
-    let mut buffer: Option<SampleBuffer<f32>> = None;
+    let mut block = Vec::new();
     let (mut packets, mut skipped) = (0usize, 0usize);
 
     loop {
         let packet = match reader.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -98,13 +106,13 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
                     &mut sample_rate,
                     &mut channels,
                     next.sample_rate,
-                    next.channels.map(|c| c.count()),
+                    next.channels.as_ref().map(Channels::count),
                 )?;
                 continue;
             }
             Err(err) => return Err(Error::InvalidInput(format!("failed to read audio: {err}"))),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         packets += 1;
@@ -123,21 +131,16 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
             }
         };
 
-        let spec = *decoded.spec();
+        let spec = decoded.spec();
         check_layout(
             &mut sample_rate,
             &mut channels,
-            Some(spec.rate),
-            Some(spec.channels.count()),
+            Some(spec.rate()),
+            Some(spec.channels().count()),
         )?;
 
-        let needed = decoded.capacity() * spec.channels.count();
-        let buf = match &mut buffer {
-            Some(buf) if buf.capacity() >= needed => buf,
-            _ => buffer.insert(SampleBuffer::new(decoded.capacity() as u64, spec)),
-        };
-        buf.copy_interleaved_ref(decoded);
-        samples.extend_from_slice(buf.samples());
+        decoded.copy_to_vec_interleaved(&mut block);
+        samples.extend_from_slice(&block);
     }
 
     // Tolerate the odd corrupt frame, but not a stream that mostly fails.
@@ -160,6 +163,7 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
         u16::try_from(channels).map_err(|_| Error::Unsupported(format!("{channels} channels")))?;
 
     Ok(DecodedAudio {
+        format,
         samples,
         sample_rate,
         channels,
@@ -170,22 +174,36 @@ fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
 /// More than 1 in this many packets failing to decode is an error.
 const MAX_SKIPPED_DENOMINATOR: usize = 10;
 
-/// Pick the first audio track and build a decoder for it.
-fn open_track(reader: &dyn FormatReader) -> Result<(u32, Box<dyn Decoder>)> {
-    let track = reader
+/// The first track with audio codec parameters.
+pub(crate) fn first_audio_track(reader: &dyn FormatReader) -> Option<(u32, &AudioCodecParameters)> {
+    reader
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .find_map(|track| match &track.codec_params {
+            Some(CodecParameters::Audio(params)) if params.codec != CODEC_ID_NULL_AUDIO => {
+                Some((track.id, params))
+            }
+            _ => None,
+        })
+}
+
+/// Pick the first audio track and build a decoder for it.
+fn open_track(reader: &dyn FormatReader) -> Result<(u32, Box<dyn AudioDecoder>)> {
+    let (id, params) = first_audio_track(reader)
         .ok_or_else(|| Error::InvalidInput("no audio track found".into()))?;
+    if params.codec == CODEC_ID_OPUS {
+        return Err(Error::Unsupported("Opus decoding is not available".into()));
+    }
 
     let decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|_| {
             Error::Unsupported(
-                "no decoder for this codec (supported: PCM, FLAC, MP3, AAC-LC, Vorbis)".into(),
+                "no decoder for this codec (supported: PCM, FLAC, MP3, AAC-LC, Vorbis, ALAC, ADPCM)"
+                    .into(),
             )
         })?;
-    Ok((track.id, decoder))
+    Ok((id, decoder))
 }
 
 /// Record the stream layout on first sight and reject later changes, which

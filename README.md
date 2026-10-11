@@ -78,15 +78,16 @@ fn main() -> speech_prep::Result<()> {
 
 ## Supported input
 
-| Format | Decoded | Notes |
-|--------|:-------:|-------|
-| WAV | yes | 8/16/24/32-bit integer and 32/64-bit float PCM |
-| FLAC | yes | |
-| MP3 | yes | |
-| AAC (MP4/M4A) | yes | AAC-LC |
-| Ogg Vorbis | yes | |
-| WebM / Matroska | partial | Vorbis audio only |
-| Opus | no | Detected, then rejected with `Error::Unsupported` |
+| Codec | Containers | Decoded |
+|-------|------------|:-------:|
+| PCM (integer, float, mu-law, A-law) | WAV, AIFF, CAF | yes |
+| ADPCM (Microsoft, IMA) | WAV | yes |
+| FLAC | FLAC, Ogg | yes |
+| ALAC | MP4/M4A, CAF | yes |
+| MP3 | MP3 | yes |
+| AAC-LC | MP4/M4A | yes |
+| Vorbis | Ogg, WebM | yes |
+| Opus | Ogg, WebM | no: detected, then rejected with `Error::Unsupported` |
 
 Decoding uses [Symphonia](https://github.com/pdeljanov/Symphonia). Any
 channel count is averaged to mono.

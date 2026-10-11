@@ -20,3 +20,10 @@ ffmpeg $q -i tone.flac -c:a libopus -b:a 32k tone.opus
 # Different layouts, appended to the files above to test mid-stream changes.
 ffmpeg $q -i tone.flac -ac 1 -c:a libmp3lame -b:a 32k tone-mono.mp3
 ffmpeg $q -i tone.flac -ar 22050 -c:a libvorbis -q:a 0 tone-22k.ogg
+
+# Formats added with Symphonia 0.6: 0.2 s, mono, 16 kHz to keep them small.
+small="-t 0.2 -ac 1 -ar 16000"
+ffmpeg $q -i tone.flac $small -c:a alac tone-alac.m4a
+ffmpeg $q -i tone.flac $small tone.aiff
+ffmpeg $q -i tone.flac $small -c:a adpcm_ima_wav tone-adpcm.wav
+ffmpeg $q -i tone.flac $small -c:a pcm_s16le tone.caf

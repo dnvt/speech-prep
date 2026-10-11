@@ -48,6 +48,39 @@ fn vorbis_in_ogg() {
     assert_decodes("tone.ogg", AudioFormat::Vorbis);
 }
 
+/// The small 0.2 s, mono, 16 kHz fixtures.
+fn assert_decodes_small(name: &str, format: AudioFormat) {
+    let audio =
+        AudioFormatConverter::convert_file(fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(audio.metadata.original_format, format, "{name}");
+    assert_eq!(audio.metadata.original_sample_rate, 16_000, "{name}");
+    assert_eq!(audio.metadata.original_channels, 1, "{name}");
+    // ADPCM pads the last block (about 64 ms at 16 kHz).
+    let duration = audio.duration_sec();
+    assert!((0.18..0.28).contains(&duration), "{name}: {duration} s");
+    assert!(!audio.is_silent(), "{name}");
+}
+
+#[test]
+fn alac_in_m4a() {
+    assert_decodes_small("tone-alac.m4a", AudioFormat::Alac);
+}
+
+#[test]
+fn aiff() {
+    assert_decodes_small("tone.aiff", AudioFormat::WavPcm);
+}
+
+#[test]
+fn caf() {
+    assert_decodes_small("tone.caf", AudioFormat::WavPcm);
+}
+
+#[test]
+fn adpcm_in_wav() {
+    assert_decodes_small("tone-adpcm.wav", AudioFormat::Adpcm);
+}
+
 #[test]
 fn opus_is_reported_as_unsupported() {
     let err = AudioFormatConverter::convert_file(fixture("tone.opus")).unwrap_err();
@@ -73,7 +106,7 @@ fn malformed_matroska_is_an_error_not_a_panic() {
         0x55,
     ];
     assert!(AudioFormatConverter::convert_to_standard(&bytes).is_err());
-    assert!(speech_prep::format::FormatDetector::detect_with_metadata(&bytes).is_err());
+    assert!(speech_prep::format::FormatDetector::detect(&bytes).is_err());
 }
 
 #[test]
@@ -101,7 +134,7 @@ fn metadata_detection_agrees_with_decoder() {
         ("tone.opus", AudioFormat::Opus, 48_000),
     ] {
         let bytes = std::fs::read(fixture(name)).unwrap();
-        let meta = FormatDetector::detect_with_metadata(&bytes).unwrap();
+        let meta = FormatDetector::detect(&bytes).unwrap();
         assert_eq!(meta.format, format, "{name}");
         assert_eq!(meta.sample_rate, Some(rate), "{name}");
     }
