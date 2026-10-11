@@ -34,6 +34,24 @@ pub(crate) struct DecodedAudio {
 /// `extension` is an optional hint such as `"wav"` or `"mp3"`; the container
 /// is still probed from the bytes.
 pub(crate) fn decode(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
+    catch_decoder_panic(|| decode_inner(data, extension))
+}
+
+/// Run code that calls into Symphonia, turning a panic into an error.
+///
+/// Symphonia 0.5 panics on some malformed input, for example a Matroska
+/// element with a zero length byte overflows a shift. Audio files are
+/// untrusted input, so a bad file must not take the caller down. This
+/// cannot help when the application is built with `panic = "abort"`.
+pub(crate) fn catch_decoder_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(Error::InvalidInput(
+            "malformed audio: the decoder rejected the stream".into(),
+        ))
+    })
+}
+
+fn decode_inner(data: &[u8], extension: Option<&str>) -> Result<DecodedAudio> {
     let source = MediaSourceStream::new(
         Box::new(Cursor::new(data.to_vec())),
         MediaSourceStreamOptions::default(),

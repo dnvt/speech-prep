@@ -65,6 +65,18 @@ fn chained_ogg_with_same_layout_decodes_both_streams() {
 }
 
 #[test]
+fn malformed_matroska_is_an_error_not_a_panic() {
+    // EBML magic followed by a zero length byte, found by fuzzing. Symphonia
+    // 0.5 overflows a shift on it.
+    let bytes = [
+        0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x16, 0x0f, 0x01, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55,
+    ];
+    assert!(AudioFormatConverter::convert_to_standard(&bytes).is_err());
+    assert!(speech_prep::format::FormatDetector::detect_with_metadata(&bytes).is_err());
+}
+
+#[test]
 fn layout_change_mid_stream_is_an_error() {
     let read = |name| std::fs::read(fixture(name)).unwrap();
 
