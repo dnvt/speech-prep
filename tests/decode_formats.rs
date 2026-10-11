@@ -114,6 +114,26 @@ fn opus_in_webm() {
 }
 
 #[test]
+fn truncated_stream_is_an_error_not_partial_audio() {
+    // A FLAC cut mid-stream. Symphonia reports an unexpected EOF; the decoder
+    // must reject it rather than return the partial audio decoded so far.
+    let err = AudioFormatConverter::convert_file(fixture("tone-truncated.flac")).unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+}
+
+#[test]
+fn decompression_bomb_is_rejected() {
+    // ~13 min of 48 kHz stereo silence: ~136 KB compressed, ~75M interleaved
+    // samples decoded, past the decoder's sample cap. Must error, not buffer
+    // gigabytes.
+    let err = AudioFormatConverter::convert_file(fixture("tone-bomb.flac")).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidInput(m) if m.contains("sample limit")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn chained_ogg_with_same_layout_decodes_both_streams() {
     let one = std::fs::read(fixture("tone.ogg")).unwrap();
     let single = AudioFormatConverter::convert_to_standard(&one).unwrap();
