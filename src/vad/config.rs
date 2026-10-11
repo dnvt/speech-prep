@@ -66,11 +66,12 @@ pub struct VadConfig {
     /// Lower bound for the spectral-flux baseline. Default: 1e-4.
     pub flux_floor: f32,
 
-    /// Frames quieter than this RMS level are never speech. Default: 0.002.
+    /// Frames quieter than this RMS level are never speech. Default: 0.0005.
     ///
     /// Measured on the pre-emphasized, windowed frame, so it sits well below
-    /// the raw signal level. Raise it to ignore faint background voices;
-    /// lower it for very quiet recordings.
+    /// the raw signal level. Background noise is handled by the adaptive
+    /// baselines, not by this gate; raise it only to ignore faint sounds in
+    /// otherwise silent recordings.
     pub min_speech_energy: f32,
 
     /// Smoothing of the adaptive threshold, in `[0.0, 1.0)`. Default: 0.9.
@@ -126,7 +127,7 @@ impl Default for VadConfig {
             flux_smoothing: 0.8,
             energy_floor: 1e-4,
             flux_floor: 1e-4,
-            min_speech_energy: 0.002,
+            min_speech_energy: 0.0005,
             threshold_smoothing: 0.9,
             activation_margin: 1.1,
             release_margin: 0.9,

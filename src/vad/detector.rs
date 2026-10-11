@@ -423,6 +423,16 @@ impl VadDetector {
                 Error::Processing(format!("flux array length mismatch at index {idx}"))
             })?;
 
+            // Seed the baselines from the start of the stream, assuming it
+            // begins with background. Frame 0 has no previous spectrum, so
+            // its flux is meaningless; seed flux from frame 1.
+            match detector_state.frames_seen {
+                0 => energy_baseline = raw_energy.max(self.config.energy_floor),
+                1 => flux_baseline = raw_flux.max(self.config.flux_floor),
+                _ => {}
+            }
+            detector_state.frames_seen += 1;
+
             let energy_denominator = energy_baseline.max(self.config.energy_floor).max(EPSILON);
             let normalized_energy =
                 (raw_energy / energy_denominator).clamp(0.0, MAX_NORMALIZED_METRIC);
@@ -490,8 +500,15 @@ impl VadDetector {
                 stats.silence_frames += 1;
             }
 
-            // Update baselines only during silence to avoid noise floor contamination
-            if !is_speech {
+            if is_speech {
+                // Track the noise floor through speech as well: follow dips
+                // quickly and rise slowly. Without this, a recording that
+                // starts with noise above the gate is classified as speech
+                // from the first frame and the baselines never adapt.
+                energy_baseline =
+                    track_floor(energy_baseline, raw_energy, silence_energy_smoothing);
+                flux_baseline = track_floor(flux_baseline, raw_flux, silence_flux_smoothing);
+            } else {
                 dynamic_threshold = silence_threshold_smoothing.mul_add(
                     dynamic_threshold,
                     (1.0 - silence_threshold_smoothing) * combined,
@@ -574,6 +591,22 @@ impl VadDetector {
     }
 }
 
+/// Per-frame factor for raising a baseline during speech. With the default
+/// 10 ms hop the baseline needs a few seconds of sustained level to rise,
+/// while words and syllables only nudge it.
+const SPEECH_FLOOR_RISE: f32 = 0.998;
+
+/// Noise-floor update during speech: fall like a normal baseline update when
+/// the frame is quieter, rise slowly when it is louder.
+fn track_floor(baseline: f32, value: f32, fall_smoothing: f32) -> f32 {
+    let smoothing = if value < baseline {
+        fall_smoothing
+    } else {
+        SPEECH_FLOOR_RISE
+    };
+    smoothing.mul_add(baseline, (1.0 - smoothing) * value)
+}
+
 fn hann_window(length: usize) -> Vec<f32> {
     if length == 0 {
         return Vec::new();
@@ -607,6 +640,8 @@ struct Frame {
 pub(super) struct DetectorState {
     /// Samples received so far.
     pub(super) processed_samples: usize,
+    /// Analysis frames processed so far.
+    pub(super) frames_seen: u64,
     /// Pre-emphasized samples not yet consumed by a complete frame.
     pub(super) carry: Vec<f32>,
     /// Stream index of `carry[0]`.
@@ -634,6 +669,7 @@ impl DetectorState {
     fn new(config: &VadConfig, spectrum_bins: usize) -> Self {
         Self {
             processed_samples: 0,
+            frames_seen: 0,
             carry: Vec::new(),
             carry_start: 0,
             last_segment_end: 0,
@@ -800,6 +836,62 @@ mod tests {
                     "gap {gap}: {pair:?}"
                 );
             }
+        }
+    }
+
+    /// Deterministic noise in [-1, 1), low-pass filtered when `brown` is set.
+    fn noise(len: usize, amplitude: f32, brown: bool) -> Vec<f32> {
+        let mut state = 0x2545_F491u32;
+        let mut low = 0.0f32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let white = (state as f32 / u32::MAX as f32).mul_add(2.0, -1.0);
+                low = 0.98f32.mul_add(low, 0.2 * white);
+                amplitude * if brown { low } else { white }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steady_noise_from_the_first_sample_is_not_speech() {
+        for (amplitude, brown) in [(0.01, false), (0.05, false), (0.05, true), (0.2, true)] {
+            let detector = VadDetector::new(VadConfig::default()).unwrap();
+            let audio = noise(SR * 5, amplitude, brown);
+            let mut segments = detector.detect(&audio).unwrap();
+            segments.extend(detector.flush().unwrap());
+            assert!(
+                segments.is_empty(),
+                "noise {amplitude} brown={brown}: {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn speech_in_noise_does_not_lock_on() {
+        // Noise loud enough to pass the absolute gate from the first frame,
+        // with two 0.6 s tones. Before the baselines tracked the floor during
+        // speech, this produced one segment covering the whole input.
+        let mut audio = noise(SR * 6, 0.05, true);
+        for start in [SR * 2, SR * 4] {
+            for (i, s) in audio[start..start + SR * 6 / 10].iter_mut().enumerate() {
+                *s += 0.4 * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / SR as f32).sin();
+            }
+        }
+
+        let detector = VadDetector::new(VadConfig::default()).unwrap();
+        let mut segments = detector.detect(&audio).unwrap();
+        segments.extend(detector.flush().unwrap());
+
+        assert_eq!(segments.len(), 2, "{segments:?}");
+        for (seg, start) in segments.iter().zip([2.0, 4.0]) {
+            assert!((seg.start_time.as_secs() - start).abs() < 0.05, "{seg:?}");
+            assert!(
+                (seg.end_time.as_secs() - (start + 0.6)).abs() < 0.1,
+                "{seg:?}"
+            );
         }
     }
 
