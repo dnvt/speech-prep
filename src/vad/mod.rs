@@ -24,7 +24,11 @@
 //! ```
 //!
 //! This is a signal-level detector. It does not distinguish speech from other
-//! sounds with similar energy and spectral change, such as music.
+//! sounds with similar energy and spectral change, such as music. The first
+//! 300 ms of a stream are used to estimate the background level, so a
+//! perfectly steady sound present from the first sample (a test tone, a hum)
+//! counts as background; speech starting at the first sample is still
+//! detected through the dips between syllables.
 
 pub mod config;
 pub mod detector;
